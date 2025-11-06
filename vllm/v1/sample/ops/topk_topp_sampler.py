@@ -506,7 +506,6 @@ def flashinfer_sample(
         next_token_ids = flashinfer.sampling.top_k_top_p_sampling_from_logits(
             logits.float().contiguous(), k, p, deterministic=True
         )
-
     return next_token_ids.view(-1)
 
 
