@@ -72,6 +72,22 @@ def _process_b12x_weights(
     experts.process_weights_after_loading(layer)
 
 
+def _process_b12x_weights(
+    experts: FlashInferB12xExperts,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w1_scale_2: torch.Tensor,
+    w2_scale_2: torch.Tensor,
+) -> None:
+    layer = SimpleNamespace(
+        w13_weight_scale=w1_scale,
+        w13_weight_scale_2=w1_scale_2,
+        w2_weight_scale=w2_scale,
+        w2_weight_scale_2=w2_scale_2,
+    )
+    experts.process_weights_after_loading(layer)
+
+
 @pytest.mark.parametrize("m,n,k", MNK_FACTORS)
 @pytest.mark.parametrize("e", [8, 16])
 @pytest.mark.parametrize("topk", [1, 2, 4])
