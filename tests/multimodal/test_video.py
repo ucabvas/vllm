@@ -41,6 +41,45 @@ pytestmark = pytest.mark.cpu_test
 ASSETS_DIR = Path(__file__).parent / "assets"
 assert ASSETS_DIR.exists()
 
+
+def _can_decode_corrupted_mp4() -> bool:
+    """Probe whether the runtime FFmpeg can demux/decode `corrupted.mp4`.
+
+    The asset is an H.264-in-MP4 clip with deliberate corruption on frame 17.
+    Codec-safe FFmpeg builds (see MR !481/!482) strip the H.264 decoder and
+    the MOV demuxer, in which case the recovery tests that depend on this
+    asset cannot run. The probe opens the file once at import time so the
+    skip is cheap.
+
+    NOTE: probes via `cv2.VideoCapture(<file-path>)` rather than the
+    production-side `BytesIO` codepath. We attempted to mirror the
+    production `OpenCVVideoBackendMixin.open_video_capture(BytesIO(...))`
+    path so probe-passes-then-test-fails could not happen, but the
+    `BytesIO` route segfaults on the codec-safe aarch64 host's bundled
+    OpenCV/FFmpeg when handed a corrupted MP4. The file-path probe is
+    stable and good enough for skip-decisions; if the file-path open
+    fails the H.264 decoder is definitively absent.
+    """
+    try:
+        import cv2
+
+        cap = cv2.VideoCapture(str(ASSETS_DIR / "corrupted.mp4"))
+        try:
+            ok = cap.isOpened() and cap.read()[0]
+        finally:
+            cap.release()
+        return bool(ok)
+    except Exception:
+        return False
+
+
+_HAS_H264_MP4 = _can_decode_corrupted_mp4()
+requires_h264_mp4 = pytest.mark.skipif(
+    not _HAS_H264_MP4,
+    reason="runtime FFmpeg lacks H.264 decoder or MOV demuxer "
+    "(codec-safe build) — corrupted.mp4 cannot be opened",
+)
+
 NUM_FRAMES = 10
 FAKE_OUTPUT_1 = np.random.rand(NUM_FRAMES, 1280, 720, 3)
 FAKE_OUTPUT_2 = np.random.rand(NUM_FRAMES, 1280, 720, 3)
@@ -304,6 +343,7 @@ def test_pynvvideocodec_decoder_slot_retains_simple_decoder():
 # ============================================================================
 
 
+@requires_h264_mp4
 @pytest.mark.parametrize(
     "model_repo, expected_loader_cls, hf_sample_kwargs",
     [
@@ -366,6 +406,10 @@ def test_video_processor_from_model_repo(
     ``VideoProcessor.sample_frames`` implementation exists, the test
     also verifies that the vLLM backend produces identical frame indices.
     """
+    # The synthetic fixture is H.264-encoded via PyAV; `av` is not installed
+    # in codec-safe builds (royalty-bearing codec removal), so skip there.
+    pytest.importorskip("av")
+
     video_processor = get_video_processor_cls_name_from_config(model_repo)
     assert video_processor is not None, (
         f"Model repo {model_repo!r} did not contain a video_processor_type "
@@ -415,6 +459,17 @@ def test_video_processor_from_model_repo(
         )
 
 
+def test_video_backend_rejects_unknown_codec_backend():
+    """`VideoBackend.load_bytes` previously accepted backend="pyav"; the
+    PyAV path was removed and the kwarg now only accepts "opencv". Any
+    other value must raise a clear ValueError, not be silently accepted.
+    """
+    loader = VIDEO_LOADER_REGISTRY.load("opencv")
+    with pytest.raises(ValueError, match="Unknown video codec backend"):
+        loader.load_bytes(b"", num_frames=1, backend="pyav")
+
+
+@requires_h264_mp4
 def test_video_backend_handles_broken_frames(monkeypatch: pytest.MonkeyPatch):
     """
     Regression test for handling videos with broken frames.
@@ -458,6 +513,7 @@ def test_video_backend_handles_broken_frames(monkeypatch: pytest.MonkeyPatch):
 # ============================================================================
 
 
+@requires_h264_mp4
 def test_video_recovery_simulated_failures(monkeypatch: pytest.MonkeyPatch):
     """
     Test that frame recovery correctly uses the next valid frame when
@@ -546,6 +602,7 @@ def test_video_recovery_simulated_failures(monkeypatch: pytest.MonkeyPatch):
         assert meta_yes["frames_indices"] == sorted(meta_yes["frames_indices"])
 
 
+@requires_h264_mp4
 def test_video_recovery_with_corrupted_file(monkeypatch: pytest.MonkeyPatch):
     """
     Test frame recovery with an actual corrupted video file using sparse sampling.
@@ -615,6 +672,7 @@ def test_video_recovery_with_corrupted_file(monkeypatch: pytest.MonkeyPatch):
         )
 
 
+@requires_h264_mp4
 def test_video_recovery_dynamic_backend(monkeypatch: pytest.MonkeyPatch):
     """
     Test that frame_recovery works with the dynamic video backend.
@@ -924,33 +982,6 @@ def test_torchcodec_backend_returns_target_frames_not_keyframes():
             {"fps": 2, "frame_sample_mode": "fps"},
             119,
             id="molmo2-fps",
-        ),
-        # uniform sampling + pyav codec (same frame counts as opencv)
-        pytest.param(
-            "opencv",
-            {"num_frames": 32, "backend": "pyav"},
-            32,
-            id="pyav-num_frames",
-        ),
-        pytest.param("opencv", {"fps": 2, "backend": "pyav"}, 120, id="pyav-fps"),
-        pytest.param(
-            "opencv",
-            {"num_frames": 500, "fps": 2, "backend": "pyav"},
-            120,
-            id="pyav-num_frames_wins_fps",
-        ),
-        # dynamic sampling + pyav codec
-        pytest.param(
-            "opencv_dynamic",
-            {"fps": 1, "max_duration": 60, "backend": "pyav"},
-            60,
-            id="pyav_dynamic-within_max_duration",
-        ),
-        pytest.param(
-            "opencv_dynamic",
-            {"fps": 2, "max_duration": 30, "backend": "pyav"},
-            60,
-            id="pyav_dynamic-exceeds_max_duration",
         ),
         # glm46v dynamic FPS (1800 frames @ 30fps = 60s)
         # 60s falls in (30, 300] → target_fps=1.0, extract_t = 60*1.0*2 = 120
