@@ -10,7 +10,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.multimodal.audio import resample_audio_pyav
+from vllm.multimodal.audio import resample_audio_scipy
 from vllm.utils.import_utils import PlaceholderModule
 from vllm.utils.serial_utils import tensor2base64
 from vllm.utils.sparse_utils import check_sparse_tensor_invariants_threadsafe
