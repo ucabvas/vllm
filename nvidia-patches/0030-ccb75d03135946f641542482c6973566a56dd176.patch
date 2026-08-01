@@ -1,0 +1,2211 @@
+From ccb75d03135946f641542482c6973566a56dd176 Mon Sep 17 00:00:00 2001
+From: Stefano Castagnetta <scastagnetta@nvidia.com>
+Date: Mon, 15 Jun 2026 02:29:51 -0700
+Subject: [PATCH] Remove royalty-bearing codecs (H.264/H.265/AAC); add
+ codec-safe FFmpeg + opencv strip
+
+Signed-off-by: Stefano Castagnetta <scastagnetta@nvidia.com>
+---
+ docker/Dockerfile                             |  28 ++-
+ docker/Dockerfile.cpu                         |  37 +++-
+ docker/Dockerfile.nightly_torch               |  27 ++-
+ docker/Dockerfile.tpu                         |  27 ++-
+ docker/Dockerfile.xpu                         |  26 ++-
+ .../installation/cpu.arm.inc.md               |   8 +-
+ requirements/common.txt                       |   8 +
+ requirements/test/cuda.in                     |   3 +-
+ requirements/test/cuda.txt                    |   8 +-
+ requirements/test/rocm.in                     |   3 +-
+ requirements/test/rocm.txt                    |  10 +-
+ requirements/test/xpu.txt                     |   4 +-
+ setup.py                                      |   1 -
+ .../multimodal/processing/test_glm4_1v.py     |   2 +-
+ tests/multimodal/media/test_audio.py          |  11 +-
+ tests/multimodal/test_audio.py                |  65 +++---
+ tests/multimodal/test_video.py                | 179 +++++----------
+ tools/build-ffmpeg-safe.sh                    | 209 ++++++++++++++++++
+ tools/strip-opencv-bundled-codecs.sh          | 194 ++++++++++++++++
+ tools/verify-ffmpeg-safe.sh                   | 140 ++++++++++++
+ vllm/assets/video.py                          |   4 +-
+ .../speech_to_text/transcription/protocol.py  |   6 +-
+ .../speech_to_text/translation/protocol.py    |   6 +-
+ .../model_executor/models/nano_nemotron_vl.py |   4 +-
+ vllm/multimodal/audio.py                      | 102 +++------
+ vllm/multimodal/media/audio.py                | 170 +++-----------
+ vllm/multimodal/parse.py                      |   2 +-
+ vllm/multimodal/video.py                      | 146 +++---------
+ 28 files changed, 909 insertions(+), 521 deletions(-)
+ create mode 100755 tools/build-ffmpeg-safe.sh
+ create mode 100755 tools/strip-opencv-bundled-codecs.sh
+ create mode 100755 tools/verify-ffmpeg-safe.sh
+
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+index d7823f321154..1ada544280a6 100644
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -650,7 +650,6 @@ RUN apt-get update -y \
+         software-properties-common \
+         curl \
+         sudo \
+-        ffmpeg \
+         libsm6 \
+         libxext6 \
+         libgl1 \
+@@ -705,6 +704,26 @@ RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
+     apt-get install -y --no-install-recommends --allow-change-held-packages libnccl-dev=${NCCL_VER} libnccl2=${NCCL_VER} && \
+     rm -rf /var/lib/apt/lists/*
+ 
++# Build and install codec-safe FFmpeg (no H.264, H.265/HEVC, or AAC).
++# See tools/build-ffmpeg-safe.sh for the exact configure flags.
++# strip-opencv-bundled-codecs.sh and verify-ffmpeg-safe.sh are also copied
++# here but kept until after the vLLM install so they can be re-invoked to
++# strip the FFmpeg libs that opencv-python-headless wheels bundle.
++COPY tools/build-ffmpeg-safe.sh /tmp/build-ffmpeg-safe.sh
++COPY tools/verify-ffmpeg-safe.sh /tmp/verify-ffmpeg-safe.sh
++COPY tools/strip-opencv-bundled-codecs.sh /tmp/strip-opencv-bundled-codecs.sh
++RUN bash /tmp/build-ffmpeg-safe.sh \
++    && bash /tmp/verify-ffmpeg-safe.sh \
++    && FFMPEG_VERSION=5.1.6 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
++        bash /tmp/build-ffmpeg-safe.sh \
++    && FFMPEG_VERSION=8.0.2 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
++        bash /tmp/build-ffmpeg-safe.sh \
++    && rm /tmp/build-ffmpeg-safe.sh \
++    && rm -rf /var/lib/apt/lists/*
++ENV PATH=/opt/ffmpeg-safe/bin:$PATH
++ENV LD_LIBRARY_PATH=/opt/ffmpeg-safe/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
++ENV PKG_CONFIG_PATH=/opt/ffmpeg-safe/lib/pkgconfig:$PKG_CONFIG_PATH
++
+ # Install uv for faster pip installs
+ RUN python3 -m pip install uv
+ 
+@@ -873,6 +892,13 @@ RUN --mount=type=cache,target=/opt/uv/cache \
+ . /etc/environment && \
+ uv pip list
+ 
++# Strip the FFmpeg shared libraries that opencv-python-headless wheels bundle
++# (private libavcodec containing H.264/HEVC/AAC) and re-verify the image is
++# codec-safe end-to-end. Must run after the vLLM pip install above.
++RUN bash /tmp/strip-opencv-bundled-codecs.sh \
++    && bash /tmp/verify-ffmpeg-safe.sh \
++    && rm /tmp/strip-opencv-bundled-codecs.sh /tmp/verify-ffmpeg-safe.sh
++
+ # Pytorch now installs NVSHMEM, setting LD_LIBRARY_PATH
+ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+ 
+diff --git a/docker/Dockerfile.cpu b/docker/Dockerfile.cpu
+index 61bad68b4425..d56d3395d797 100644
+--- a/docker/Dockerfile.cpu
++++ b/docker/Dockerfile.cpu
+@@ -30,15 +30,35 @@ ARG PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu"
+ ARG max_jobs=32
+ ENV MAX_JOBS=${max_jobs}
+ 
+-# Install minimal dependencies and uv
++# Install minimal dependencies and uv. `ffmpeg` was removed from this
++# apt list as part of the royalty-bearing codec audit; the codec-safe
++# FFmpeg replacement is built in the RUN block below.
+ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+     --mount=type=cache,target=/var/lib/apt,sharing=locked \
+     apt-get update -y \
+     && apt-get install -y --no-install-recommends sudo ccache git curl wget ca-certificates zlib1g-dev \
+-    gcc-12 g++-12 libtcmalloc-minimal4 libnuma-dev ffmpeg libsm6 libxext6 libgl1 jq lsof make xz-utils \
++    gcc-12 g++-12 libtcmalloc-minimal4 libnuma-dev libsm6 libxext6 libgl1 jq lsof make xz-utils \
+     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 --slave /usr/bin/g++ g++ /usr/bin/g++-12 \
+     && curl -LsSf https://astral.sh/uv/install.sh | sh
+ 
++# Build and install codec-safe FFmpeg (no H.264, H.265/HEVC, or AAC).
++# verify-ffmpeg-safe.sh and strip-opencv-bundled-codecs.sh are retained at
++# /tmp so they can be re-invoked after pip installs (to strip the FFmpeg
++# libs that opencv-python-headless wheels bundle).
++COPY tools/build-ffmpeg-safe.sh /tmp/build-ffmpeg-safe.sh
++COPY tools/verify-ffmpeg-safe.sh /tmp/verify-ffmpeg-safe.sh
++COPY tools/strip-opencv-bundled-codecs.sh /tmp/strip-opencv-bundled-codecs.sh
++RUN bash /tmp/build-ffmpeg-safe.sh \
++    && bash /tmp/verify-ffmpeg-safe.sh \
++    && FFMPEG_VERSION=5.1.6 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
++        bash /tmp/build-ffmpeg-safe.sh \
++    && FFMPEG_VERSION=8.0.2 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
++        bash /tmp/build-ffmpeg-safe.sh \
++    && rm /tmp/build-ffmpeg-safe.sh
++ENV PATH=/opt/ffmpeg-safe/bin:$PATH
++ENV LD_LIBRARY_PATH=/opt/ffmpeg-safe/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
++ENV PKG_CONFIG_PATH=/opt/ffmpeg-safe/lib/pkgconfig:$PKG_CONFIG_PATH
++
+ # Compiler and linker environment
+ ENV CC=/usr/bin/gcc-12 CXX=/usr/bin/g++-12
+ ENV CCACHE_DIR=/root/.cache/ccache
+@@ -294,6 +314,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
+         uv pip install "$(realpath dist/*.whl)"; \
+     fi
+ 
++# Strip the FFmpeg shared libraries that opencv-python-headless wheels bundle
++# (private libavcodec containing H.264/HEVC/AAC) and re-verify the image is
++# codec-safe end-to-end. Must run after the vLLM pip install above.
++RUN bash /tmp/strip-opencv-bundled-codecs.sh \
++    && bash /tmp/verify-ffmpeg-safe.sh
++
+ # Add labels to document build configuration
+ LABEL org.opencontainers.image.title="vLLM CPU"
+ LABEL org.opencontainers.image.description="vLLM inference engine for CPU platforms"
+@@ -327,4 +353,11 @@ RUN if [ "$TARGETARCH" != "amd64" ]; then \
+ RUN --mount=type=cache,target=/root/.cache/uv \
+     uv pip install "vllm[zen]"
+ 
++# Strip the FFmpeg shared libraries that opencv-python-headless wheels bundle
++# (private libavcodec containing H.264/HEVC/AAC) and re-verify the image is
++# codec-safe end-to-end. Must run after the vLLM pip install above.
++RUN bash /tmp/strip-opencv-bundled-codecs.sh \
++    && bash /tmp/verify-ffmpeg-safe.sh \
++    && rm /tmp/strip-opencv-bundled-codecs.sh /tmp/verify-ffmpeg-safe.sh
++
+ ENTRYPOINT ["vllm", "serve"]
+diff --git a/docker/Dockerfile.nightly_torch b/docker/Dockerfile.nightly_torch
+index 149c265d7e2d..988960a80f78 100644
+--- a/docker/Dockerfile.nightly_torch
++++ b/docker/Dockerfile.nightly_torch
+@@ -211,7 +211,7 @@ RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
+ # Install Python and other dependencies
+ RUN apt-get update -y \
+     && apt-get install -y ccache software-properties-common git curl wget sudo vim python3-pip \
+-    && apt-get install -y ffmpeg libsm6 libxext6 libgl1 \
++    && apt-get install -y libsm6 libxext6 libgl1 \
+     && for i in 1 2 3; do \
+         add-apt-repository -y ppa:deadsnakes/ppa && break || \
+         { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
+@@ -227,6 +227,24 @@ RUN apt-get update -y \
+ RUN --mount=type=cache,target=/root/.cache/uv \
+     python3 -m pip install uv
+ 
++# Build and install codec-safe FFmpeg (no H.264, H.265/HEVC, or AAC).
++# verify-ffmpeg-safe.sh and strip-opencv-bundled-codecs.sh are retained at
++# /tmp so they can be re-invoked after pip installs (to strip the FFmpeg
++# libs that opencv-python-headless wheels bundle).
++COPY tools/build-ffmpeg-safe.sh /tmp/build-ffmpeg-safe.sh
++COPY tools/verify-ffmpeg-safe.sh /tmp/verify-ffmpeg-safe.sh
++COPY tools/strip-opencv-bundled-codecs.sh /tmp/strip-opencv-bundled-codecs.sh
++RUN bash /tmp/build-ffmpeg-safe.sh \
++    && bash /tmp/verify-ffmpeg-safe.sh \
++    && FFMPEG_VERSION=5.1.6 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
++        bash /tmp/build-ffmpeg-safe.sh \
++    && FFMPEG_VERSION=8.0.2 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
++        bash /tmp/build-ffmpeg-safe.sh \
++    && rm /tmp/build-ffmpeg-safe.sh
++ENV PATH=/opt/ffmpeg-safe/bin:$PATH
++ENV LD_LIBRARY_PATH=/opt/ffmpeg-safe/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
++ENV PKG_CONFIG_PATH=/opt/ffmpeg-safe/lib/pkgconfig:$PKG_CONFIG_PATH
++
+ # This timeout (in seconds) is necessary when installing some dependencies via uv since it's likely to time out
+ # Reference: https://github.com/astral-sh/uv/pull/1694
+ ENV UV_HTTP_TIMEOUT=500
+@@ -248,6 +266,13 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/vllm
+     --mount=type=cache,target=/root/.cache/uv \
+     uv pip install --system vllm-dist/*.whl --verbose
+ 
++# Strip the FFmpeg shared libraries that opencv-python-headless wheels bundle
++# (private libavcodec containing H.264/HEVC/AAC) and re-verify the image is
++# codec-safe end-to-end. Must run after the vLLM pip install above.
++RUN bash /tmp/strip-opencv-bundled-codecs.sh \
++    && bash /tmp/verify-ffmpeg-safe.sh \
++    && rm /tmp/strip-opencv-bundled-codecs.sh /tmp/verify-ffmpeg-safe.sh
++
+ ARG torch_cuda_arch_list='8.0;8.6;8.9;9.0'
+ 
+ # install package for build flashinfer
+diff --git a/docker/Dockerfile.tpu b/docker/Dockerfile.tpu
+index ca2d7833c1ef..2d5d1e5b5748 100644
+--- a/docker/Dockerfile.tpu
++++ b/docker/Dockerfile.tpu
+@@ -7,9 +7,27 @@ WORKDIR /workspace/vllm
+ # Install some basic utilities
+ RUN apt-get update && apt-get install -y \
+     git \
+-    ffmpeg libsm6 libxext6 libgl1 && \
++    libsm6 libxext6 libgl1 && \
+     rm -rf /var/lib/apt/lists/*
+ 
++# Build and install codec-safe FFmpeg (no H.264, H.265/HEVC, or AAC).
++# verify-ffmpeg-safe.sh and strip-opencv-bundled-codecs.sh are retained at
++# /tmp so they can be re-invoked after pip installs (to strip the FFmpeg
++# libs that opencv-python-headless wheels bundle).
++COPY tools/build-ffmpeg-safe.sh /tmp/build-ffmpeg-safe.sh
++COPY tools/verify-ffmpeg-safe.sh /tmp/verify-ffmpeg-safe.sh
++COPY tools/strip-opencv-bundled-codecs.sh /tmp/strip-opencv-bundled-codecs.sh
++RUN bash /tmp/build-ffmpeg-safe.sh \
++    && bash /tmp/verify-ffmpeg-safe.sh \
++    && FFMPEG_VERSION=5.1.6 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
++        bash /tmp/build-ffmpeg-safe.sh \
++    && FFMPEG_VERSION=8.0.2 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
++        bash /tmp/build-ffmpeg-safe.sh \
++    && rm /tmp/build-ffmpeg-safe.sh
++ENV PATH=/opt/ffmpeg-safe/bin:$PATH
++ENV LD_LIBRARY_PATH=/opt/ffmpeg-safe/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
++ENV PKG_CONFIG_PATH=/opt/ffmpeg-safe/lib/pkgconfig:$PKG_CONFIG_PATH
++
+ # Build vLLM.
+ COPY . .
+ ARG GIT_REPO_CHECK=0
+@@ -33,4 +51,11 @@ RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install -e .
+ # install development dependencies (for testing)
+ RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install -e tests/vllm_test_utils
+ 
++# Strip the FFmpeg shared libraries that opencv-python-headless wheels bundle
++# (private libavcodec containing H.264/HEVC/AAC) and re-verify the image is
++# codec-safe end-to-end. Must run after the vLLM pip install above.
++RUN bash /tmp/strip-opencv-bundled-codecs.sh \
++    && bash /tmp/verify-ffmpeg-safe.sh \
++    && rm /tmp/strip-opencv-bundled-codecs.sh /tmp/verify-ffmpeg-safe.sh
++
+ CMD ["/bin/bash"]
+diff --git a/docker/Dockerfile.xpu b/docker/Dockerfile.xpu
+index a7bc9ae7d5c9..b7d83f7a9585 100644
+--- a/docker/Dockerfile.xpu
++++ b/docker/Dockerfile.xpu
+@@ -42,7 +42,6 @@ ARG PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu"
+ RUN apt clean && apt-get update -y && \
+     apt-get install -y --no-install-recommends --fix-missing \
+     curl \
+-    ffmpeg \
+     git \
+     libsndfile1 \
+     libsm6 \
+@@ -57,6 +56,24 @@ RUN apt clean && apt-get update -y && \
+     python3.12-dev \
+     python3-pip
+ 
++# Build and install codec-safe FFmpeg (no H.264, H.265/HEVC, or AAC).
++# verify-ffmpeg-safe.sh and strip-opencv-bundled-codecs.sh are retained at
++# /tmp so they can be re-invoked after pip installs (to strip the FFmpeg
++# libs that opencv-python-headless wheels bundle).
++COPY tools/build-ffmpeg-safe.sh /tmp/build-ffmpeg-safe.sh
++COPY tools/verify-ffmpeg-safe.sh /tmp/verify-ffmpeg-safe.sh
++COPY tools/strip-opencv-bundled-codecs.sh /tmp/strip-opencv-bundled-codecs.sh
++RUN bash /tmp/build-ffmpeg-safe.sh \
++    && bash /tmp/verify-ffmpeg-safe.sh \
++    && FFMPEG_VERSION=5.1.6 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
++        bash /tmp/build-ffmpeg-safe.sh \
++    && FFMPEG_VERSION=8.0.2 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
++        bash /tmp/build-ffmpeg-safe.sh \
++    && rm /tmp/build-ffmpeg-safe.sh
++ENV PATH=/opt/ffmpeg-safe/bin:$PATH
++ENV LD_LIBRARY_PATH=/opt/ffmpeg-safe/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
++ENV PKG_CONFIG_PATH=/opt/ffmpeg-safe/lib/pkgconfig:$PKG_CONFIG_PATH
++
+ # Add oneAPI repo, pin oneAPI to 2025.3, then install pinned packages in one layer.
+ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
+     echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | tee /etc/apt/sources.list.d/oneAPI.list && \
+@@ -232,4 +249,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
+ RUN --mount=type=cache,target=/root/.cache/uv \
+     uv pip install -e tests/vllm_test_utils
+ 
++# Strip the FFmpeg shared libraries that opencv-python-headless wheels bundle
++# (private libavcodec containing H.264/HEVC/AAC) and re-verify the image is
++# codec-safe end-to-end. Must run after all vLLM pip installs above.
++RUN bash /tmp/strip-opencv-bundled-codecs.sh \
++    && bash /tmp/verify-ffmpeg-safe.sh \
++    && rm /tmp/strip-opencv-bundled-codecs.sh /tmp/verify-ffmpeg-safe.sh
++
+ ENTRYPOINT ["vllm", "serve"]
+diff --git a/docs/getting_started/installation/cpu.arm.inc.md b/docs/getting_started/installation/cpu.arm.inc.md
+index 7a783b53c65f..a74fdff8a34d 100644
+--- a/docs/getting_started/installation/cpu.arm.inc.md
++++ b/docs/getting_started/installation/cpu.arm.inc.md
+@@ -82,8 +82,14 @@ First, install the recommended compiler. We recommend using `gcc/g++ >= 12.3.0`
+ 
+ ```bash
+ sudo apt-get update  -y
+-sudo apt-get install -y --no-install-recommends ccache git curl wget ca-certificates gcc-12 g++-12 libtcmalloc-minimal4 libnuma-dev ffmpeg libsm6 libxext6 libgl1 jq lsof
++sudo apt-get install -y --no-install-recommends ccache git curl wget ca-certificates gcc-12 g++-12 libtcmalloc-minimal4 libnuma-dev libsm6 libxext6 libgl1 jq lsof
+ sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 --slave /usr/bin/g++ g++ /usr/bin/g++-12
++# Build codec-safe FFmpeg (no H.264, H.265/HEVC, or AAC) — see tools/build-ffmpeg-safe.sh
++sudo bash tools/build-ffmpeg-safe.sh
++sudo bash tools/verify-ffmpeg-safe.sh
++export PATH=/opt/ffmpeg-safe/bin:$PATH
++export LD_LIBRARY_PATH=/opt/ffmpeg-safe/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
++export PKG_CONFIG_PATH=/opt/ffmpeg-safe/lib/pkgconfig:$PKG_CONFIG_PATH
+ ```
+ 
+ Second, clone the vLLM project:
+diff --git a/requirements/common.txt b/requirements/common.txt
+index 42c4ff84160a..a391913fc293 100644
+--- a/requirements/common.txt
++++ b/requirements/common.txt
+@@ -3,6 +3,8 @@ cachetools
+ psutil
+ sentencepiece  # Required for LLaMA tokenizer.
+ numpy
++scipy >= 1.10  # required for audio resampling (resample_audio_scipy)
++soundfile >= 0.12.0  # required for royalty-free audio decode (WAV/FLAC/OGG)
+ requests >= 2.26.0
+ tqdm
+ blake3
+@@ -36,6 +38,12 @@ jsonschema >= 4.23.0 # required for MiniMax M3 tool schema validation
+ pyzmq >= 25.0.0
+ msgspec
+ mistral_common[image] >= 1.11.3
++# TODO: opencv-python-headless wheels bundle their own FFmpeg under
++# site-packages/opencv_python_headless.libs/, which includes native H.264,
++# H.265/HEVC, and AAC decoders. /opt/ffmpeg-safe (MR !481/!482) does not
++# close this path because cv2 is RPATH-linked to its bundled libs. See
++# docs/royalty_codec_audit_report.md "Known gap" section for mitigation
++# options. Track replacement work in a follow-up issue before merging.
+ opencv-python-headless >= 4.13.0    # required for video IO
+ pyyaml
+ six>=1.16.0; python_version > '3.11' # transitive dependency of pandas that needs to be the latest version for python 3.12
+diff --git a/requirements/test/cuda.in b/requirements/test/cuda.in
+index 4609f8b64cd1..810590c1ac59 100644
+--- a/requirements/test/cuda.in
++++ b/requirements/test/cuda.in
+@@ -10,7 +10,6 @@ pytest-cov
+ 
+ # testing utils
+ albumentations # required for Nemotron Parse in test_common.py
+-av  # required for audio_in_video tests
+ backoff # required for phi4mm test
+ blobfile # required for kimi-vl test
+ einops # required for MPT, qwen-vl
+@@ -38,7 +37,7 @@ opencv-python-headless >= 4.13.0 # required for video test
+ datamodel_code_generator # required for minicpm3 test
+ lm-eval[api]>=0.4.12 # required for model evaluation test
+ mteb[bm25s]>=2, <3 # required for mteb test
+-transformers==5.6.0
++transformers==5.6.1
+ tokenizers==0.22.2
+ schemathesis>=4.0.0 # Required for openai schema test.
+ # quantization
+diff --git a/requirements/test/cuda.txt b/requirements/test/cuda.txt
+index 91683be22ab3..986fb7a65075 100644
+--- a/requirements/test/cuda.txt
++++ b/requirements/test/cuda.txt
+@@ -43,8 +43,6 @@ attrs==24.2.0
+     #   referencing
+ audioread==3.0.1
+     # via librosa
+-av==16.1.0
+-    # via -r requirements/test/cuda.in
+ azure-core==1.38.2
+     # via
+     #   azure-identity
+@@ -672,7 +670,7 @@ pyarrow==23.0.0
+     # via
+     #   datasets
+     #   genai-perf
+-pyasn1==0.6.3  # CVE-2026-30922
++pyasn1==0.6.3
+     # via
+     #   pyasn1-modules
+     #   rsa
+@@ -863,6 +861,7 @@ scikit-learn==1.5.2
+     #   sentence-transformers
+ scipy==1.13.1
+     # via
++    #   -c requirements/common.txt
+     #   albumentations
+     #   bm25s
+     #   imagehash
+@@ -905,6 +904,7 @@ sortedcontainers==2.4.0
+     # via hypothesis
+ soundfile==0.12.1
+     # via
++    #   -c requirements/common.txt
+     #   -r requirements/test/cuda.in
+     #   genai-perf
+     #   librosa
+@@ -1016,7 +1016,7 @@ tqdm==4.67.3
+     #   segmentation-models-pytorch
+     #   sentence-transformers
+     #   transformers
+-transformers==5.6.0
++transformers==5.6.1
+     # via
+     #   -c requirements/common.txt
+     #   -r requirements/test/cuda.in
+diff --git a/requirements/test/rocm.in b/requirements/test/rocm.in
+index 4846e8ab4c5b..d26ab1b4459d 100644
+--- a/requirements/test/rocm.in
++++ b/requirements/test/rocm.in
+@@ -12,7 +12,6 @@ pytest-cov
+ 
+ # testing utils
+ albumentations # required for Nemotron Parse in test_common.py
+-av # required for audio_in_video tests
+ backoff # required for phi4mm test
+ blobfile # required for kimi-vl test
+ einops # required for MPT, qwen-vl
+@@ -37,7 +36,7 @@ opencv-python-headless>=4.13.0 # required for video test
+ datamodel_code_generator # required for minicpm3 test
+ lm-eval[api]>=0.4.12 # required for model evaluation test
+ mteb[bm25s]>=2, <3 # required for mteb test
+-transformers==5.6.0
++transformers==5.6.1
+ tokenizers==0.22.2
+ schemathesis>=4.0.0 # Required for openai schema test
+ # quantization
+diff --git a/requirements/test/rocm.txt b/requirements/test/rocm.txt
+index f057eeb1977a..cf05ac6c0f8c 100644
+--- a/requirements/test/rocm.txt
++++ b/requirements/test/rocm.txt
+@@ -60,8 +60,6 @@ attrs==26.1.0
+     #   referencing
+ audioread==3.0.1
+     # via librosa
+-av==16.1.0
+-    # via -r requirements/test/rocm.in
+ azure-core==1.39.0
+     # via
+     #   azure-identity
+@@ -1059,6 +1057,8 @@ scikit-learn==1.8.0
+     #   sentence-transformers
+ scipy==1.17.1
+     # via
++    #   -c requirements/common.txt
++    #   -r requirements/test/../common.txt
+     #   albumentations
+     #   bm25s
+     #   imagehash
+@@ -1115,6 +1115,8 @@ sortedcontainers==2.4.0
+     # via hypothesis
+ soundfile==0.13.1
+     # via
++    #   -c requirements/common.txt
++    #   -r requirements/test/../common.txt
+     #   -r requirements/test/rocm.in
+     #   genai-perf
+     #   librosa
+@@ -1219,7 +1221,7 @@ tqdm==4.67.3
+     #   sentence-transformers
+     #   tilelang
+     #   transformers
+-transformers==5.6.0
++transformers==5.6.1
+     # via
+     #   -c requirements/common.txt
+     #   -r requirements/test/../common.txt
+@@ -1337,7 +1339,7 @@ word2number==1.1
+     # via lm-eval
+ wrapt==2.1.2
+     # via smart-open
+-xgrammar==0.2.1
++xgrammar==0.2.0
+     # via
+     #   -c requirements/common.txt
+     #   -r requirements/test/../common.txt
+diff --git a/requirements/test/xpu.txt b/requirements/test/xpu.txt
+index c467627a0f76..9adbff8811f7 100644
+--- a/requirements/test/xpu.txt
++++ b/requirements/test/xpu.txt
+@@ -554,6 +554,7 @@ scikit-learn==1.8.0
+     #   sentence-transformers
+ scipy==1.17.1
+     # via
++    #   -c requirements/common.txt
+     #   albumentations
+     #   bm25s
+     #   librosa
+@@ -583,6 +584,7 @@ sortedcontainers==2.4.0
+     # via hypothesis
+ soundfile==0.13.1
+     # via
++    #   -c requirements/common.txt
+     #   -r requirements/test/xpu.in
+     #   librosa
+     #   mistral-common
+@@ -667,7 +669,7 @@ tqdm==4.67.3
+     #   pqdm
+     #   sentence-transformers
+     #   transformers
+-transformers==5.6.0
++transformers==5.6.1
+     # via
+     #   -c requirements/common.txt
+     #   sentence-transformers
+diff --git a/setup.py b/setup.py
+index ad9aed07a31c..66507e7ec5e0 100644
+--- a/setup.py
++++ b/setup.py
+@@ -1248,7 +1248,6 @@ def add_vllm_package_data(filename: str) -> None:
+         "instanttensor": ["instanttensor >= 0.1.5"],
+         "runai": ["runai-model-streamer[s3,gcs,azure] >= 0.15.7"],
+         "audio": [
+-            "av",
+             "scipy",
+             "soundfile",
+             "soxr",
+diff --git a/tests/models/multimodal/processing/test_glm4_1v.py b/tests/models/multimodal/processing/test_glm4_1v.py
+index 5798c5663472..f5f26b7c11ff 100644
+--- a/tests/models/multimodal/processing/test_glm4_1v.py
++++ b/tests/models/multimodal/processing/test_glm4_1v.py
+@@ -70,7 +70,7 @@ def test_processor_override(
+ 
+ @pytest.mark.parametrize("model_id", ["zai-org/GLM-4.1V-9B-Thinking"])
+ @pytest.mark.parametrize("fps", [2])
+-@pytest.mark.parametrize("backend", ["opencv", "pyav"])
++@pytest.mark.parametrize("backend", ["opencv"])
+ def test_video_loader_consistency(
+     model_id: str,
+     fps: int,
+diff --git a/tests/multimodal/media/test_audio.py b/tests/multimodal/media/test_audio.py
+index e894483505e2..7a89e069daf8 100644
+--- a/tests/multimodal/media/test_audio.py
++++ b/tests/multimodal/media/test_audio.py
+@@ -86,10 +86,11 @@ def test_load_audio_max_duration_rejected(dummy_audio_bytes):
+ 
+ 
+ def test_audio_media_io_from_video(video_assets):
++    """MP4/AAC container audio is intentionally not supported after codec removal."""
+     audio_io = AudioMediaIO()
+     video_path = video_assets[0].video_path
+-    with open(video_path, "rb") as f:
+-        audio, sr = audio_io.load_bytes(f.read())
+-    audio_ref, sr_ref = load_audio(video_path, sr=None)
+-    assert sr == sr_ref
+-    np.testing.assert_allclose(audio_ref, audio, atol=1e-4)
++    with (
++        open(video_path, "rb") as f,
++        pytest.raises(ValueError, match="AAC/MP4/M4A"),
++    ):
++        audio_io.load_bytes(f.read())
+diff --git a/tests/multimodal/test_audio.py b/tests/multimodal/test_audio.py
+index 7e6a66946a32..06dc1eda8376 100644
+--- a/tests/multimodal/test_audio.py
++++ b/tests/multimodal/test_audio.py
+@@ -15,7 +15,6 @@
+     AudioSpec,
+     ChannelReduction,
+     normalize_audio,
+-    resample_audio_pyav,
+     resample_audio_scipy,
+     split_audio,
+ )
+@@ -26,16 +25,6 @@ def dummy_audio():
+     return np.array([0.0, 0.1, 0.2, 0.3, 0.4], dtype=float)
+ 
+ 
+-def test_resample_audio_pyav(dummy_audio):
+-    out_down = resample_audio_pyav(dummy_audio, orig_sr=4, target_sr=2)
+-    out_up = resample_audio_pyav(dummy_audio, orig_sr=2, target_sr=4)
+-    out_same = resample_audio_pyav(dummy_audio, orig_sr=4, target_sr=4)
+-
+-    assert len(out_down) == 3
+-    assert len(out_up) == 10
+-    assert np.all(out_same == dummy_audio)
+-
+-
+ def test_resample_audio_scipy(dummy_audio):
+     out_down = resample_audio_scipy(dummy_audio, orig_sr=4, target_sr=2)
+     out_up = resample_audio_scipy(dummy_audio, orig_sr=2, target_sr=4)
+@@ -76,17 +65,6 @@ def test_resample_audio_scipy_resamples_last_axis_for_multichannel():
+     assert np.isfinite(out).all()
+ 
+ 
+-def test_audio_resampler_pyav_calls_resample(dummy_audio):
+-    resampler = AudioResampler(target_sr=22050, method="pyav")
+-    with patch("vllm.multimodal.audio.resample_audio_pyav") as mock_resample:
+-        mock_resample.return_value = dummy_audio
+-        out = resampler.resample(dummy_audio, orig_sr=44100)
+-        mock_resample.assert_called_once_with(
+-            dummy_audio, orig_sr=44100, target_sr=22050
+-        )
+-        assert np.all(out == dummy_audio)
+-
+-
+ def test_audio_resampler_scipy_calls_resample(dummy_audio):
+     resampler = AudioResampler(target_sr=22050, method="scipy")
+     with patch("vllm.multimodal.audio.resample_audio_scipy") as mock_resample:
+@@ -98,12 +76,6 @@ def test_audio_resampler_scipy_calls_resample(dummy_audio):
+         assert np.all(out == dummy_audio)
+ 
+ 
+-def test_audio_resampler_invalid_method(dummy_audio):
+-    resampler = AudioResampler(target_sr=22050, method="invalid")
+-    with pytest.raises(ValueError):
+-        resampler.resample(dummy_audio, orig_sr=44100)
+-
+-
+ def test_audio_resampler_no_target_sr(dummy_audio):
+     resampler = AudioResampler(target_sr=None)
+     with pytest.raises(RuntimeError):
+@@ -443,13 +415,13 @@ def test_soundfile_format_normalized_to_mono_e2e(self):
+         # Verify channel averaging: mean of [0.5, -0.5] = 0.0
+         np.testing.assert_array_almost_equal(audio_output, np.zeros(16000), decimal=5)
+ 
+-    def test_pyav_mono_passthrough_e2e(self):
+-        """Full pipeline: pyav mono format → preserved as mono."""
++    def test_mono_1d_passthrough_e2e(self):
++        """Full pipeline: 1-D mono audio array → preserved as mono."""
+         from vllm.multimodal.parse import MultiModalDataParser
+ 
+-        # Simulate pyav output: already mono (time,) format
+-        mono_pyav = np.random.randn(16000).astype(np.float32)
+-        assert mono_pyav.shape == (16000,)
++        # Simulate decoder output that is already mono in (time,) shape.
++        mono_audio = np.random.randn(16000).astype(np.float32)
++        assert mono_audio.shape == (16000,)
+ 
+         # Create parser with mono normalization
+         parser = MultiModalDataParser(
+@@ -458,7 +430,7 @@ def test_pyav_mono_passthrough_e2e(self):
+         )
+ 
+         # Process audio through the parser
+-        result = parser._parse_audio_data((mono_pyav, 16000))
++        result = parser._parse_audio_data((mono_audio, 16000))
+         audio_output = result.get(0)
+ 
+         # Verify output is still mono 1D
+@@ -466,7 +438,7 @@ def test_pyav_mono_passthrough_e2e(self):
+         assert audio_output.shape == (16000,)
+ 
+         # Verify audio content is preserved
+-        np.testing.assert_array_almost_equal(audio_output, mono_pyav)
++        np.testing.assert_array_almost_equal(audio_output, mono_audio)
+ 
+     def test_multichannel_5_1_surround_to_mono_e2e(self):
+         """Full pipeline: 5.1 surround (6 channels) → mono output."""
+@@ -744,6 +716,29 @@ def test_find_split_point_silence(self):
+         # from start_idx, so the quietest scanned window starts at 19200.
+         assert split_idx == 19200
+ 
++    def test_find_split_point_short_search_region_returns_start_idx(self):
++        """When the search region is shorter than `min_energy_window`, the
++        loop body never executes; the function must return `start_idx`
++        rather than `0`, otherwise `split_audio` produces a zero-length
++        leading chunk. Regression test for the fix where `quietest_idx`
++        was previously initialised to 0.
++        """
++        from vllm.multimodal.audio import find_split_point
++
++        segment = np.ones(32000, dtype=np.float32)
++        # Search region length (100) is much smaller than the energy window
++        # (1600), so no window fits and the loop never iterates.
++        split_idx = find_split_point(
++            wav=segment,
++            start_idx=20000,
++            end_idx=20100,
++            min_energy_window=1600,
++        )
++
++        assert split_idx == 20000, (
++            f"Expected start_idx (20000) when no window fits; got {split_idx}"
++        )
++
+     def test_split_audio_preserves_boundaries(self):
+         """Verify first and last samples are preserved when chunking."""
+ 
+diff --git a/tests/multimodal/test_video.py b/tests/multimodal/test_video.py
+index 694eb392c487..9d8eef9e3825 100644
+--- a/tests/multimodal/test_video.py
++++ b/tests/multimodal/test_video.py
+@@ -31,6 +31,45 @@
+ ASSETS_DIR = Path(__file__).parent / "assets"
+ assert ASSETS_DIR.exists()
+ 
++
++def _can_decode_corrupted_mp4() -> bool:
++    """Probe whether the runtime FFmpeg can demux/decode `corrupted.mp4`.
++
++    The asset is an H.264-in-MP4 clip with deliberate corruption on frame 17.
++    Codec-safe FFmpeg builds (see MR !481/!482) strip the H.264 decoder and
++    the MOV demuxer, in which case the recovery tests that depend on this
++    asset cannot run. The probe opens the file once at import time so the
++    skip is cheap.
++
++    NOTE: probes via `cv2.VideoCapture(<file-path>)` rather than the
++    production-side `BytesIO` codepath. We attempted to mirror the
++    production `OpenCVVideoBackendMixin.open_video_capture(BytesIO(...))`
++    path so probe-passes-then-test-fails could not happen, but the
++    `BytesIO` route segfaults on the codec-safe aarch64 host's bundled
++    OpenCV/FFmpeg when handed a corrupted MP4. The file-path probe is
++    stable and good enough for skip-decisions; if the file-path open
++    fails the H.264 decoder is definitively absent.
++    """
++    try:
++        import cv2
++
++        cap = cv2.VideoCapture(str(ASSETS_DIR / "corrupted.mp4"))
++        try:
++            ok = cap.isOpened() and cap.read()[0]
++        finally:
++            cap.release()
++        return bool(ok)
++    except Exception:
++        return False
++
++
++_HAS_H264_MP4 = _can_decode_corrupted_mp4()
++requires_h264_mp4 = pytest.mark.skipif(
++    not _HAS_H264_MP4,
++    reason="runtime FFmpeg lacks H.264 decoder or MOV demuxer "
++    "(codec-safe build) — corrupted.mp4 cannot be opened",
++)
++
+ NUM_FRAMES = 10
+ FAKE_OUTPUT_1 = np.random.rand(NUM_FRAMES, 1280, 720, 3)
+ FAKE_OUTPUT_2 = np.random.rand(NUM_FRAMES, 1280, 720, 3)
+@@ -70,6 +109,7 @@ def test_video_loader_type_doesnt_exist():
+ # ============================================================================
+ 
+ 
++@requires_h264_mp4
+ @pytest.mark.parametrize(
+     "model_repo, expected_loader_cls, hf_sample_kwargs",
+     [
+@@ -132,6 +172,10 @@ def test_video_processor_from_model_repo(
+     ``VideoProcessor.sample_frames`` implementation exists, the test
+     also verifies that the vLLM backend produces identical frame indices.
+     """
++    # The synthetic fixture is H.264-encoded via PyAV; `av` is not installed
++    # in codec-safe builds (royalty-bearing codec removal), so skip there.
++    pytest.importorskip("av")
++
+     video_processor = get_video_processor_cls_name_from_config(model_repo)
+     assert video_processor is not None, (
+         f"Model repo {model_repo!r} did not contain a video_processor_type "
+@@ -181,6 +225,17 @@ def test_video_processor_from_model_repo(
+         )
+ 
+ 
++def test_video_backend_rejects_unknown_codec_backend():
++    """`VideoBackend.load_bytes` previously accepted backend="pyav"; the
++    PyAV path was removed and the kwarg now only accepts "opencv". Any
++    other value must raise a clear ValueError, not be silently accepted.
++    """
++    loader = VIDEO_LOADER_REGISTRY.load("opencv")
++    with pytest.raises(ValueError, match="Unknown video codec backend"):
++        loader.load_bytes(b"", num_frames=1, backend="pyav")
++
++
++@requires_h264_mp4
+ def test_video_backend_handles_broken_frames(monkeypatch: pytest.MonkeyPatch):
+     """
+     Regression test for handling videos with broken frames.
+@@ -224,6 +279,7 @@ def test_video_backend_handles_broken_frames(monkeypatch: pytest.MonkeyPatch):
+ # ============================================================================
+ 
+ 
++@requires_h264_mp4
+ def test_video_recovery_simulated_failures(monkeypatch: pytest.MonkeyPatch):
+     """
+     Test that frame recovery correctly uses the next valid frame when
+@@ -312,6 +368,7 @@ def release(self):
+         assert meta_yes["frames_indices"] == sorted(meta_yes["frames_indices"])
+ 
+ 
++@requires_h264_mp4
+ def test_video_recovery_with_corrupted_file(monkeypatch: pytest.MonkeyPatch):
+     """
+     Test frame recovery with an actual corrupted video file using sparse sampling.
+@@ -381,6 +438,7 @@ def test_video_recovery_with_corrupted_file(monkeypatch: pytest.MonkeyPatch):
+         )
+ 
+ 
++@requires_h264_mp4
+ def test_video_recovery_dynamic_backend(monkeypatch: pytest.MonkeyPatch):
+     """
+     Test that frame_recovery works with the dynamic video backend.
+@@ -444,94 +502,6 @@ def dummy_video_path(tmp_path):
+ 
+ 
+ # ============================================================================
+-# PyAV Backend Tests
+-# ============================================================================
+-
+-
+-def test_pyav_backend_loads_frames(dummy_video_path, monkeypatch: pytest.MonkeyPatch):
+-    """Test that the pyav codec backend can load frames from a valid video."""
+-    with monkeypatch.context() as m:
+-        m.setenv("VLLM_VIDEO_LOADER_BACKEND", "opencv")
+-
+-        with open(dummy_video_path, "rb") as f:
+-            video_data = f.read()
+-
+-        loader = VIDEO_LOADER_REGISTRY.load("opencv")
+-        frames, metadata = loader.load_bytes(video_data, num_frames=8, backend="pyav")
+-
+-        assert frames.ndim == 4
+-        assert frames.shape[3] == 3  # RGB
+-        assert frames.shape[0] == 8
+-        assert frames.shape[0] == len(metadata["frames_indices"])
+-        assert metadata["video_backend"] == "pyav"
+-        assert "total_num_frames" in metadata
+-        assert "fps" in metadata
+-        assert "duration" in metadata
+-
+-
+-def test_pyav_dynamic_backend_loads_frames(
+-    dummy_video_path, monkeypatch: pytest.MonkeyPatch
+-):
+-    """Test that the pyav codec with dynamic sampling can load frames."""
+-    with monkeypatch.context() as m:
+-        m.setenv("VLLM_VIDEO_LOADER_BACKEND", "opencv_dynamic")
+-
+-        with open(dummy_video_path, "rb") as f:
+-            video_data = f.read()
+-
+-        loader = VIDEO_LOADER_REGISTRY.load("opencv_dynamic")
+-        frames, metadata = loader.load_bytes(
+-            video_data, fps=2, max_duration=10, backend="pyav"
+-        )
+-
+-        assert frames.ndim == 4
+-        assert frames.shape[3] == 3  # RGB
+-        assert frames.shape[0] > 0
+-        assert frames.shape[0] == len(metadata["frames_indices"])
+-        assert metadata["video_backend"] == "pyav_dynamic"
+-
+-
+-def test_pyav_backend_returns_target_frames_not_keyframes():
+-    """Regression test: PyAV must decode forward past the seek keyframe.
+-
+-    container.seek() snaps backward to the nearest keyframe. With a long GOP
+-    (here: one keyframe at frame 0), a decoder that does not advance forward
+-    to the target PTS collapses every sampled slot onto the keyframe. This
+-    test encodes a per-frame marker on the green channel and verifies the
+-    returned frames are distinct, ordered, and match the requested indices.
+-    """
+-    num_frames = 50
+-    num_sampled = 4
+-    height, width = 64, 64
+-
+-    video_bytes = create_long_gop_video(
+-        num_frames=num_frames, width=width, height=height
+-    )
+-
+-    loader = VIDEO_LOADER_REGISTRY.load("opencv")
+-    frames, metadata = loader.load_bytes(
+-        video_bytes, num_frames=num_sampled, backend="pyav"
+-    )
+-    assert frames.shape == (num_sampled, height, width, 3)
+-
+-    requested = list(metadata["frames_indices"])
+-    assert len(requested) == num_sampled
+-
+-    actual = [int(f[height // 2, width // 2, 1]) for f in frames]
+-
+-    assert len(set(actual)) == num_sampled, (
+-        f"PyAV returned only {len(set(actual))} distinct frames for "
+-        f"{num_sampled} requested indices: markers={actual}, "
+-        f"requested={requested}. Keyframe-snap regression."
+-    )
+-
+-    assert actual == sorted(actual), f"Returned frames out of order: markers={actual}"
+-
+-    for marker, want_idx in zip(actual, requested):
+-        assert abs(marker - want_idx) <= 10, (
+-            f"Frame mismatch: requested index {want_idx}, "
+-            f"got marker {marker} (tolerance ±10)"
+-        )
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -579,33 +549,6 @@ def test_pyav_backend_returns_target_frames_not_keyframes():
+             119,
+             id="molmo2-fps",
+         ),
+-        # uniform sampling + pyav codec (same frame counts as opencv)
+-        pytest.param(
+-            "opencv",
+-            {"num_frames": 32, "backend": "pyav"},
+-            32,
+-            id="pyav-num_frames",
+-        ),
+-        pytest.param("opencv", {"fps": 2, "backend": "pyav"}, 120, id="pyav-fps"),
+-        pytest.param(
+-            "opencv",
+-            {"num_frames": 500, "fps": 2, "backend": "pyav"},
+-            120,
+-            id="pyav-num_frames_wins_fps",
+-        ),
+-        # dynamic sampling + pyav codec
+-        pytest.param(
+-            "opencv_dynamic",
+-            {"fps": 1, "max_duration": 60, "backend": "pyav"},
+-            60,
+-            id="pyav_dynamic-within_max_duration",
+-        ),
+-        pytest.param(
+-            "opencv_dynamic",
+-            {"fps": 2, "max_duration": 30, "backend": "pyav"},
+-            60,
+-            id="pyav_dynamic-exceeds_max_duration",
+-        ),
+         # glm46v dynamic FPS (1800 frames @ 30fps = 60s)
+         # 60s falls in (30, 300] → target_fps=1.0, extract_t = 60*1.0*2 = 120
+         pytest.param(
+@@ -614,12 +557,6 @@ def test_pyav_backend_returns_target_frames_not_keyframes():
+             120,
+             id="glm46v-60s",
+         ),
+-        pytest.param(
+-            "glm46v",
+-            {"backend": "pyav"},
+-            120,
+-            id="glm46v-pyav-60s",
+-        ),
+     ],
+ )
+ def test_video_loader_frames_sampling(
+diff --git a/tools/build-ffmpeg-safe.sh b/tools/build-ffmpeg-safe.sh
+new file mode 100755
+index 000000000000..b96b25332c7a
+--- /dev/null
++++ b/tools/build-ffmpeg-safe.sh
+@@ -0,0 +1,209 @@
++#!/usr/bin/env bash
++# Build a codec-safe FFmpeg from source.
++#
++# LOOSE variant: disables the H.264, H.265/HEVC, and AAC codec
++# encoders/decoders/parsers, but KEEPS the MP4/M4A/MOV container muxers
++# and demuxers. This means VP9-in-MP4 still works (MP4 container is
++# demuxable; only its AAC audio stream is rejected by codec). MP4 files
++# that contain AAC audio will fail at decode time, not at container open.
++#
++# Installs to /opt/ffmpeg-safe.
++#
++# Requires apt-based system. Installs and removes build deps (build-only
++# packages are purged at the end to keep Docker layer sizes small).
++
++set -euo pipefail
++
++FFMPEG_VERSION="${FFMPEG_VERSION:-7.1}"
++FFMPEG_PREFIX="${FFMPEG_PREFIX:-/opt/ffmpeg-safe}"
++FFMPEG_TARBALL_URL="https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
++# Tarball hash pinned in-script for tamper-evident builds. Update when
++# bumping FFMPEG_VERSION. The upstream .sha256sum URL is not reliably
++# served (404 on some releases), so we inline the canonical hash here
++# instead of fetching it from the same host as the tarball.
++FFMPEG_SHA256_7_1="40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6"
++# FFmpeg 5.1 LTS pin — used by the cv2-shim variant whose SONAME majors
++# (libavcodec.so.59, libavformat.so.59, libavutil.so.57, libswscale.so.6,
++# libswresample.so.4) match opencv-python-headless 4.13's bundled FFmpeg
++# on arm64 / aarch64.
++FFMPEG_SHA256_5_1_6="f4fa066278f7a47feab316fef905f4db0d5e9b589451949740f83972b30901bd"
++# FFmpeg 8.0 LTS pin — used by the cv2-shim variant whose SONAME majors
++# (libavcodec.so.62, libavformat.so.62, libavutil.so.60, libswscale.so.9,
++# libswresample.so.6) match opencv-python-headless 4.13's bundled FFmpeg
++# on amd64 / x86_64. The wheel builders apparently bundle different
++# FFmpeg majors per platform, so both shims are required.
++FFMPEG_SHA256_8_0_2="5d16962332603c427b3d0887fc12b9166d6ee2cb1108b1865dd2d5eb06a09505"
++BUILD_DIR="$(mktemp -d)"
++
++echo "[build-ffmpeg-safe] Installing build dependencies..."
++export DEBIAN_FRONTEND=noninteractive
++apt-get update
++apt-get install -y --no-install-recommends \
++    ca-certificates \
++    wget \
++    xz-utils \
++    pkg-config \
++    build-essential \
++    nasm \
++    yasm \
++    libvpx-dev \
++    libvorbis-dev \
++    libopus-dev \
++    libdav1d-dev \
++    libsoxr-dev
++
++echo "[build-ffmpeg-safe] Downloading FFmpeg ${FFMPEG_VERSION}..."
++cd "${BUILD_DIR}"
++tarball="ffmpeg-${FFMPEG_VERSION}.tar.xz"
++wget -q "${FFMPEG_TARBALL_URL}" -O "${tarball}"
++# Look up the pinned hash for this version. Fail loudly if the version
++# was bumped without updating the pin above.
++sha256_var="FFMPEG_SHA256_${FFMPEG_VERSION//./_}"
++expected_sha256="${!sha256_var:-}"
++if [[ -z "${expected_sha256}" ]]; then
++    echo "[build-ffmpeg-safe] ERROR: no pinned SHA-256 for FFmpeg ${FFMPEG_VERSION}." >&2
++    echo "  Add ${sha256_var} near the top of this script." >&2
++    exit 1
++fi
++echo "${expected_sha256}  ${tarball}" | sha256sum -c -
++tar -xf "${tarball}"
++cd "ffmpeg-${FFMPEG_VERSION}"
++
++echo "[build-ffmpeg-safe] Configuring (LOOSE: codecs disabled, MP4/MOV demuxers preserved)..."
++./configure \
++    --prefix="${FFMPEG_PREFIX}" \
++    --enable-shared \
++    --disable-static \
++    --disable-doc \
++    --disable-debug \
++    --disable-gpl \
++    --disable-nonfree \
++    \
++    --enable-libvpx \
++    --enable-libvorbis \
++    --enable-libopus \
++    --enable-libdav1d \
++    --enable-libsoxr \
++    \
++    --disable-libopenh264 \
++    --disable-libx264 \
++    --disable-libx265 \
++    --disable-libfdk-aac \
++    \
++    --disable-decoder=h264 \
++    --disable-decoder=hevc \
++    --disable-decoder=h264_v4l2m2m \
++    --disable-decoder=h264_vaapi \
++    --disable-decoder=h264_nvdec \
++    --disable-decoder=h264_cuvid \
++    --disable-decoder=h264_qsv \
++    --disable-decoder=hevc_v4l2m2m \
++    --disable-decoder=hevc_vaapi \
++    --disable-decoder=hevc_nvdec \
++    --disable-decoder=hevc_cuvid \
++    --disable-decoder=hevc_qsv \
++    --disable-decoder=aac \
++    --disable-decoder=aac_latm \
++    --disable-decoder=aac_fixed \
++    \
++    --disable-encoder=h264_v4l2m2m \
++    --disable-encoder=h264_vaapi \
++    --disable-encoder=h264_nvenc \
++    --disable-encoder=h264_amf \
++    --disable-encoder=h264_mf \
++    --disable-encoder=h264_qsv \
++    --disable-encoder=hevc_v4l2m2m \
++    --disable-encoder=hevc_vaapi \
++    --disable-encoder=hevc_nvenc \
++    --disable-encoder=hevc_amf \
++    --disable-encoder=hevc_mf \
++    --disable-encoder=hevc_qsv \
++    --disable-encoder=aac \
++    --disable-encoder=aac_mf \
++    --disable-encoder=aac_at \
++    \
++    --disable-parser=h264 \
++    --disable-parser=hevc \
++    --disable-parser=aac \
++    --disable-parser=aac_latm \
++    \
++    --disable-bsf=aac_adtstoasc \
++    --disable-bsf=h264_metadata \
++    --disable-bsf=h264_mp4toannexb \
++    --disable-bsf=h264_redundant_pps \
++    --disable-bsf=hevc_metadata \
++    --disable-bsf=hevc_mp4toannexb
++
++echo "[build-ffmpeg-safe] Building (this may take 5-10 minutes)..."
++make -j"$(nproc)"
++
++echo "[build-ffmpeg-safe] Installing to ${FFMPEG_PREFIX}..."
++make install
++
++echo "[build-ffmpeg-safe] Registering shared libraries with ldconfig..."
++# Use a per-prefix config filename so multiple invocations (system FFmpeg
++# at /opt/ffmpeg-safe + cv2-shim variants at /opt/ffmpeg-safe-cv2-shim-vN)
++# do not stomp on each other. A single shared filename caused
++# /etc/ld.so.conf.d/ffmpeg-safe.conf to be overwritten on each call,
++# leaving only the last-built prefix in the linker search path.
++ldconf_basename="$(basename "${FFMPEG_PREFIX}")"
++echo "${FFMPEG_PREFIX}/lib" > "/etc/ld.so.conf.d/${ldconf_basename}.conf"
++ldconfig
++
++echo "[build-ffmpeg-safe] Cleaning up build tree and build-only packages..."
++cd /
++rm -rf "${BUILD_DIR}"
++# Protect the runtime shared libraries from autoremove. FFmpeg dynamically
++# links against these at runtime, but apt does not know that — `apt` only
++# tracks dpkg-level dependencies, and /opt/ffmpeg-safe is not a dpkg package.
++# Without this step the runtime libs (libvpx9, libvorbis0a, libopus0,
++# libdav1d7, libsoxr0, libogg0, libvorbisfile3, libvorbisenc2, libsoxr-lsr0)
++# get swept by `apt-get autoremove` after the -dev packages are purged below.
++#
++# Use `dpkg-query` (lists actually-installed packages, independent of
++# whether the apt cache is generated) rather than `apt-cache pkgnames`,
++# which returns nothing when the cache has not been pre-generated.
++#
++# Regexes are broadened to cover every runtime variant (e.g. libvorbisfile3
++# and libvorbisenc2 in addition to libvorbis0a), and libogg* is added
++# because libvorbis pulls it in transitively.
++runtime_libs="$(dpkg-query -W -f='${Package}\n' 2>/dev/null \
++    | grep -E '^(libvpx[0-9]+|libvorbis[0-9a-z]+|libogg[0-9]+|libopus[0-9]+|libdav1d[0-9]+|libsoxr[0-9]+|libsoxr-lsr[0-9]+)$' \
++    || true)"
++if [[ -n "${runtime_libs}" ]]; then
++    echo "[build-ffmpeg-safe] Marking runtime libs as manually-installed:"
++    echo "${runtime_libs}" | sed 's/^/  /'
++    # shellcheck disable=SC2086
++    apt-mark manual ${runtime_libs}
++else
++    echo "[build-ffmpeg-safe] WARNING: no runtime libs matched; autoremove may sweep them" >&2
++fi
++# NOTE: `build-essential` is intentionally NOT purged. It transitively
++# pulls in dpkg-dev / libc6-dev / header packages that downstream
++# Dockerfile RUN layers may rely on. Purging it here can silently
++# break later stages.
++apt-get purge -y \
++    nasm \
++    yasm \
++    libvpx-dev \
++    libvorbis-dev \
++    libopus-dev \
++    libdav1d-dev \
++    libsoxr-dev
++apt-get autoremove -y
++apt-get clean
++rm -rf /var/lib/apt/lists/*
++
++# Final sanity check: verify FFmpeg can actually load its dependencies.
++# This catches the autoremove-stripped-runtime-libs failure mode before
++# verify-ffmpeg-safe.sh runs (which would otherwise produce a confusing
++# error about "ffmpeg: error while loading shared libraries").
++if ! "${FFMPEG_PREFIX}/bin/ffmpeg" -version >/dev/null 2>&1; then
++    echo "[build-ffmpeg-safe] FAIL: ${FFMPEG_PREFIX}/bin/ffmpeg cannot load its dependencies." >&2
++    echo "[build-ffmpeg-safe] Missing libraries:" >&2
++    ldd "${FFMPEG_PREFIX}/bin/ffmpeg" 2>&1 | grep "not found" | sed 's/^/  /' >&2
++    exit 1
++fi
++
++echo "[build-ffmpeg-safe] Done. FFmpeg installed at ${FFMPEG_PREFIX}"
++"${FFMPEG_PREFIX}/bin/ffmpeg" -version | head -1
+diff --git a/tools/strip-opencv-bundled-codecs.sh b/tools/strip-opencv-bundled-codecs.sh
+new file mode 100755
+index 000000000000..31593229b3a4
+--- /dev/null
++++ b/tools/strip-opencv-bundled-codecs.sh
+@@ -0,0 +1,194 @@
++#!/usr/bin/env bash
++# Replace the bundled FFmpeg shared libraries that opencv-python-headless
++# wheels ship under site-packages/opencv_python_headless.libs/ with symlinks
++# to a codec-safe FFmpeg shim of matching SONAME major version.
++#
++# Why this matters: those bundled libraries include FFmpeg's internal native
++# H.264, H.265/HEVC, and AAC decoders compiled into libavcodec.so.
++# /opt/ffmpeg-safe (the system codec-safe FFmpeg at the latest major) does
++# NOT close this path because cv2 is RPATH-linked to its own bundled libs
++# and the dynamic linker resolves them via the cv2 module's NEEDED entries,
++# not the system soname registry. Distributing a binary that contains the
++# codec implementations triggers MPEG-LA / Access Advance royalty
++# obligations even if no code path ever invokes them at runtime.
++#
++# Why symlinks and not deletion: cv2.cpython-XXX-XXX-linux-gnu.so has a hard
++# NEEDED entry on libavcodec-<hash>.so.<major> (from when opencv was
++# wheel-built). Deleting the bundled lib causes the dynamic linker to fail
++# when `import cv2` runs, breaking ALL cv2 use including image operations
++# (imread, imwrite, resize, cvtColor). Symlinking to a same-SONAME-major
++# codec-safe library keeps cv2 importable, keeps image operations working,
++# and keeps cv2.VideoCapture working for non-royalty codec containers, while
++# removing the H.264/HEVC/AAC code from distribution.
++#
++# Why multiple shims: opencv-python-headless 4.13 bundles different FFmpeg
++# major versions per platform: avcodec.so.59 (FFmpeg 5.1.x) on arm64,
++# avcodec.so.62 (FFmpeg 8.x) on amd64. We install both shims and pick the
++# matching one per bundled-lib SONAME major. Shim directories are
++# /opt/ffmpeg-safe-cv2-shim-v<N> where N is the major. Override via
++# FFMPEG_CV2_SHIM_GLOB if you install them elsewhere.
++
++set -euo pipefail
++
++FFMPEG_CV2_SHIM_GLOB="${FFMPEG_CV2_SHIM_GLOB:-/opt/ffmpeg-safe-cv2-shim-v*}"
++
++# Build the soname → shim-path map by enumerating every shim's lib dir.
++declare -A shim_for_soname
++shopt -s nullglob
++for shim_dir in ${FFMPEG_CV2_SHIM_GLOB}; do
++    lib_dir="${shim_dir}/lib"
++    [[ -d "${lib_dir}" ]] || continue
++    for lib in "${lib_dir}"/lib{av,sw,postproc}*.so.[0-9]*; do
++        [[ -f "${lib}" ]] || continue
++        soname="$(basename "${lib}")"
++        # Keep only sonames of the form libfoo.so.MAJOR (no .MINOR.PATCH suffix).
++        if [[ "${soname}" =~ ^lib[a-z]+\.so\.[0-9]+$ ]]; then
++            shim_for_soname["${soname}"]="${lib}"
++        fi
++    done
++done
++
++if [[ ${#shim_for_soname[@]} -eq 0 ]]; then
++    echo "[strip-opencv-bundled-codecs] ERROR: no codec-safe shim found under ${FFMPEG_CV2_SHIM_GLOB}" >&2
++    echo "  Build at least one cv2 shim before running this script, e.g.:" >&2
++    echo "    FFMPEG_VERSION=5.1.6 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 bash build-ffmpeg-safe.sh" >&2
++    echo "    FFMPEG_VERSION=8.0.2 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 bash build-ffmpeg-safe.sh" >&2
++    exit 1
++fi
++
++echo "[strip-opencv-bundled-codecs] discovered shim libraries:"
++for soname in $(printf '%s\n' "${!shim_for_soname[@]}" | sort); do
++    echo "  ${soname} -> ${shim_for_soname[${soname}]}"
++done
++
++# Locate the bundled-libs directory next to the cv2 package.
++opencv_libs_dir="$(python3 - <<'PY'
++import importlib.util, pathlib, sys
++spec = importlib.util.find_spec("cv2")
++if spec is None or spec.origin is None:
++    sys.exit(0)  # cv2 not installed; nothing to do
++parent = pathlib.Path(spec.origin).parent
++for cand in (parent.parent / "opencv_python_headless.libs",
++             parent / "opencv_python_headless.libs"):
++    if cand.is_dir():
++        print(cand)
++        sys.exit(0)
++PY
++)"
++
++if [[ -z "${opencv_libs_dir}" ]]; then
++    echo "[strip-opencv-bundled-codecs] cv2 not installed; nothing to do"
++    exit 0
++fi
++
++if [[ ! -d "${opencv_libs_dir}" ]]; then
++    echo "[strip-opencv-bundled-codecs] no bundled-libs directory at ${opencv_libs_dir}; nothing to do"
++    exit 0
++fi
++
++echo "[strip-opencv-bundled-codecs] bundled-libs dir: ${opencv_libs_dir}"
++
++# For each bundled FFmpeg shared library, extract its family + major SONAME
++# and replace the bundled file with a symlink to the matching shim lib.
++#
++# Bundled filename format produced by pip's auditwheel:
++#   libavcodec-5696b3bf.so.59.37.100
++#       ^         ^         ^  ^   ^
++#       family    hash      major minor patch
++replaced_any=0
++# libav* family that ships in FFmpeg. Note: `libavif` is the AVIF image codec
++# library (royalty-free, separate from FFmpeg) and is intentionally NOT in
++# this list — it has its own SONAME (libavif.so.16) that no FFmpeg shim
++# provides, and it carries no royalty obligation, so we leave it alone.
++for prefix in libavcodec libavdevice libavfilter libavformat libavutil libswresample libswscale libpostproc; do
++    for bundled in "${opencv_libs_dir}/${prefix}"-*.so.*; do
++        name="$(basename "${bundled}")"
++        # Extract major version: libavcodec-5696b3bf.so.59.37.100 -> 59
++        major="$(echo "${name}" | sed -E 's/^lib[a-z]+-[0-9a-f]+\.so\.([0-9]+).*$/\1/')"
++        if ! [[ "${major}" =~ ^[0-9]+$ ]]; then
++            echo "[strip-opencv-bundled-codecs] WARNING: could not parse major from ${name}; skipping" >&2
++            continue
++        fi
++        soname="${prefix}.so.${major}"
++        shim_path="${shim_for_soname[${soname}]:-}"
++        if [[ -z "${shim_path}" ]]; then
++            # No installed shim provides this soname. The configure-time
++            # disable flags in build-ffmpeg-safe.sh may have removed this
++            # library entirely (e.g. libavfilter if --disable-avfilter was
++            # passed). Remove the bundled copy so it does not ship; cv2
++            # paths that NEEDED it will fail at runtime, which is acceptable
++            # since those paths were either the royalty-bearing ones we are
++            # removing or unrelated paths that an upstream change broke.
++            echo "[strip-opencv-bundled-codecs] WARN: no shim provides ${soname}; removing ${name}" >&2
++            rm -f -- "${bundled}"
++            replaced_any=1
++            continue
++        fi
++        rm -f -- "${bundled}"
++        ln -s "${shim_path}" "${bundled}"
++        echo "[strip-opencv-bundled-codecs] ${name} -> ${shim_path}"
++        replaced_any=1
++    done
++done
++
++if [[ ${replaced_any} -eq 0 ]]; then
++    echo "[strip-opencv-bundled-codecs] no bundled FFmpeg libraries found; idempotent re-run"
++fi
++
++# Confirm cv2 imports. Image ops (imread/imwrite/resize/cvtColor) do not
++# call into FFmpeg, so they should keep working through the symlinked
++# safe libavcodec. cv2.VideoCapture for safe codec containers (WebM/Opus,
++# etc.) should also keep working; H.264/HEVC/AAC video opens will fail
++# because the shim has those codecs explicitly disabled.
++if ! python3 -c 'import cv2; print(f"[strip-opencv-bundled-codecs] cv2 imports OK ({cv2.__version__})")'; then
++    echo "[strip-opencv-bundled-codecs] ERROR: cv2 fails to import after strip" >&2
++    exit 1
++fi
++
++# Final assertion: every FFmpeg lib file (libavcodec/libavdevice/libavfilter/
++# libavformat/libavutil/libswresample/libswscale/libpostproc) under the
++# bundled-libs dir is now either absent (no shim provided it) or a symlink
++# that resolves outside that directory. We must not ship a regular file
++# there, since that would mean we left the bundled royalty-bearing binary
++# in place.
++#
++# Glob explicitly lists each FFmpeg family rather than using `libav*` —
++# `libavif` (AVIF image codec, royalty-free, separate library) matches
++# `libav*` but is not FFmpeg and is intentionally left untouched.
++bad="$(find "${opencv_libs_dir}" -maxdepth 1 -type f \
++    \( -name 'libavcodec-*.so.*'      -o -name 'libavdevice-*.so.*' \
++       -o -name 'libavfilter-*.so.*'  -o -name 'libavformat-*.so.*' \
++       -o -name 'libavutil-*.so.*'    -o -name 'libswresample-*.so.*' \
++       -o -name 'libswscale-*.so.*'   -o -name 'libpostproc-*.so.*' \) \
++    -printf '%f\n' 2>/dev/null || true)"
++if [[ -n "${bad}" ]]; then
++    echo "[strip-opencv-bundled-codecs] FAIL: bundled FFmpeg regular files still present:" >&2
++    echo "${bad}" | sed 's/^/    /' >&2
++    exit 1
++fi
++
++# Confirm any symlinks we created resolve to one of the shim prefixes.
++echo "[strip-opencv-bundled-codecs] Symlink resolution check:"
++for link in "${opencv_libs_dir}"/libavcodec-*.so.* \
++            "${opencv_libs_dir}"/libavdevice-*.so.* \
++            "${opencv_libs_dir}"/libavfilter-*.so.* \
++            "${opencv_libs_dir}"/libavformat-*.so.* \
++            "${opencv_libs_dir}"/libavutil-*.so.* \
++            "${opencv_libs_dir}"/libswresample-*.so.* \
++            "${opencv_libs_dir}"/libswscale-*.so.* \
++            "${opencv_libs_dir}"/libpostproc-*.so.*; do
++    [[ -L "${link}" ]] || continue
++    target="$(readlink -f "${link}")"
++    matched=0
++    for shim_dir in ${FFMPEG_CV2_SHIM_GLOB}; do
++        case "${target}" in
++            "${shim_dir}/"*) matched=1; status="OK (${shim_dir})"; break ;;
++        esac
++    done
++    if [[ ${matched} -eq 0 ]]; then
++        status="UNEXPECTED → ${target}"
++    fi
++    echo "  ${status}: $(basename "${link}")"
++done
++
++echo "[strip-opencv-bundled-codecs] Done. Bundled royalty-bearing FFmpeg replaced with shim symlinks."
+diff --git a/tools/verify-ffmpeg-safe.sh b/tools/verify-ffmpeg-safe.sh
+new file mode 100755
+index 000000000000..64e85d3e0b07
+--- /dev/null
++++ b/tools/verify-ffmpeg-safe.sh
+@@ -0,0 +1,140 @@
++#!/usr/bin/env bash
++# Verify that the installed FFmpeg does NOT support the royalty-bearing
++# codecs (H.264, H.265/HEVC, AAC).
++#
++# Exits non-zero if any forbidden codec is reported as a decoder (D), encoder
++# (E), or parser. Intended to gate the Docker build.
++
++set -euo pipefail
++
++FFMPEG="${FFMPEG:-/opt/ffmpeg-safe/bin/ffmpeg}"
++FFMPEG_PREFIX="${FFMPEG_PREFIX:-/opt/ffmpeg-safe}"
++
++# Ensure the shared libs are findable even if ldconfig was not run.
++# Use the `${VAR:+:$VAR}` idiom so an unset upstream value does not leave
++# a trailing colon — a trailing `:` in LD_LIBRARY_PATH means "CWD".
++export LD_LIBRARY_PATH="${FFMPEG_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
++
++if [[ ! -x "${FFMPEG}" ]]; then
++    echo "[verify-ffmpeg-safe] ERROR: ${FFMPEG} not found or not executable" >&2
++    exit 1
++fi
++
++echo "[verify-ffmpeg-safe] Verifying ${FFMPEG}..."
++"${FFMPEG}" -version | head -1
++
++forbidden_codecs=(h264 hevc aac)
++fail=0
++
++# `ffmpeg -codecs` lists every codec with capability flags: DEV.LS h264 ...
++# Columns: D=decode, E=encode, V/A/S=video/audio/subtitle, I/L/S=intra/lossy/lossless.
++# We fail if any forbidden codec line shows D or E in the first 6 chars.
++codec_table="$("${FFMPEG}" -hide_banner -codecs 2>/dev/null)"
++
++for codec in "${forbidden_codecs[@]}"; do
++    # Match a codec name appearing as the 2nd field of -codecs output,
++    # with at least one of D/E in the capability flags.
++    line="$(echo "${codec_table}" | awk -v c="${codec}" '
++        $2 == c {
++            flags = $1
++            if (flags ~ /D/ || flags ~ /E/) print
++        }
++    ')"
++    if [[ -n "${line}" ]]; then
++        echo "[verify-ffmpeg-safe] FAIL: ${codec} present with D/E capability: ${line}" >&2
++        fail=1
++    else
++        echo "[verify-ffmpeg-safe] OK: ${codec} absent or non-functional"
++    fi
++done
++
++# Also confirm at least one royalty-free codec is present so the build is useful.
++# `av1` is included because the build wires `--enable-libdav1d`; without this
++# check a broken dav1d link would silently produce an AV1-less binary that
++# still passes the forbidden-codec checks above.
++required_codecs=(vp9 opus vorbis av1)
++for codec in "${required_codecs[@]}"; do
++    if ! echo "${codec_table}" | awk -v c="${codec}" '$2 == c { print; found=1; exit } END { exit !found }' >/dev/null; then
++        echo "[verify-ffmpeg-safe] FAIL: required royalty-free codec ${codec} missing" >&2
++        fail=1
++    else
++        echo "[verify-ffmpeg-safe] OK: ${codec} present"
++    fi
++done
++
++# Verify forbidden-codec parser absence by inspecting libavcodec's exported
++# symbols. FFmpeg does NOT expose a `-parsers` CLI option (verified against
++# ffmpeg 7.1 — only -codecs / -decoders / -encoders / -formats / -muxers /
++# -demuxers / -bsfs / -filters / -pix_fmts are listable). Parser registration
++# symbols are named `ff_<codec>_parser` in libavcodec; if the configure-time
++# `--disable-parser=<codec>` was honored, those symbols will be absent.
++libavcodec="$(ls -1 "${FFMPEG_PREFIX}/lib/libavcodec.so."* 2>/dev/null | head -1 || true)"
++if [[ -z "${libavcodec}" || ! -f "${libavcodec}" ]]; then
++    echo "[verify-ffmpeg-safe] FAIL: cannot locate libavcodec.so under ${FFMPEG_PREFIX}/lib/" >&2
++    fail=1
++else
++    if ! command -v nm >/dev/null 2>&1; then
++        echo "[verify-ffmpeg-safe] WARNING: nm not available; skipping parser symbol check" >&2
++    else
++        parser_symbols="$(nm -D --defined-only "${libavcodec}" 2>/dev/null | awk '{print $NF}' || true)"
++        forbidden_parsers=(h264 hevc aac aac_latm)
++        for parser in "${forbidden_parsers[@]}"; do
++            if echo "${parser_symbols}" | grep -q "^ff_${parser}_parser$"; then
++                echo "[verify-ffmpeg-safe] FAIL: ff_${parser}_parser symbol present in $(basename "${libavcodec}")" >&2
++                fail=1
++            else
++                echo "[verify-ffmpeg-safe] OK: ff_${parser}_parser absent from $(basename "${libavcodec}")"
++            fi
++        done
++    fi
++fi
++
++# Verify that opencv-python-headless, if installed, has had its bundled
++# FFmpeg shared libraries stripped (see tools/strip-opencv-bundled-codecs.sh).
++# opencv-python-headless wheels ship a private FFmpeg under
++# site-packages/opencv_python_headless.libs/ that includes H.264/HEVC/AAC
++# decoders compiled into libavcodec.so. cv2 is RPATH-linked to those bundles,
++# so /opt/ffmpeg-safe does not close that path; the only sound mitigation is
++# physical removal of the bundled FFmpeg libraries.
++opencv_libs_dir="$(python3 - <<'PY' 2>/dev/null || true
++import importlib.util, pathlib, sys
++spec = importlib.util.find_spec("cv2")
++if spec is None or spec.origin is None:
++    sys.exit(0)
++parent = pathlib.Path(spec.origin).parent
++for cand in (parent.parent / "opencv_python_headless.libs",
++             parent / "opencv_python_headless.libs"):
++    if cand.is_dir():
++        print(cand)
++        sys.exit(0)
++PY
++)"
++if [[ -n "${opencv_libs_dir}" && -d "${opencv_libs_dir}" ]]; then
++    # Glob explicitly lists each FFmpeg family — `libavif` (AVIF image codec,
++    # royalty-free, separate library) matches `libav*` but is not FFmpeg
++    # and must be left alone.
++    remaining="$(find "${opencv_libs_dir}" -maxdepth 1 -type f \
++        \( -name 'libavcodec-*.so.*'      -o -name 'libavdevice-*.so.*' \
++           -o -name 'libavfilter-*.so.*'  -o -name 'libavformat-*.so.*' \
++           -o -name 'libavutil-*.so.*'    -o -name 'libswresample-*.so.*' \
++           -o -name 'libswscale-*.so.*'   -o -name 'libpostproc-*.so.*' \) \
++        -printf '%f\n' 2>/dev/null || true)"
++    if [[ -n "${remaining}" ]]; then
++        echo "[verify-ffmpeg-safe] FAIL: opencv-python-headless bundles FFmpeg under" >&2
++        echo "  ${opencv_libs_dir}:" >&2
++        echo "${remaining}" | sed 's/^/    /' >&2
++        echo "  Run tools/strip-opencv-bundled-codecs.sh after pip install." >&2
++        fail=1
++    else
++        echo "[verify-ffmpeg-safe] OK: no bundled FFmpeg in ${opencv_libs_dir}"
++    fi
++else
++    echo "[verify-ffmpeg-safe] OK: opencv-python-headless not installed (no bundled FFmpeg to check)"
++fi
++
++if [[ ${fail} -ne 0 ]]; then
++    echo "[verify-ffmpeg-safe] Verification FAILED" >&2
++    exit 1
++fi
++
++echo "[verify-ffmpeg-safe] Verification PASSED — no royalty-bearing codecs detected"
+diff --git a/vllm/assets/video.py b/vllm/assets/video.py
+index 72cd196c68f4..d5100ea61e90 100644
+--- a/vllm/assets/video.py
++++ b/vllm/assets/video.py
+@@ -9,7 +9,7 @@
+ import numpy.typing as npt
+ from PIL import Image
+ 
+-from vllm.multimodal.media.audio import load_audio_pyav
++from vllm.multimodal.media.audio import load_audio
+ from vllm.transformers_utils.repo_utils import hf_api
+ 
+ from .base import get_cache_dir
+@@ -141,4 +141,4 @@ def get_audio(self, sampling_rate: float | None = None) -> npt.NDArray:
+ 
+         See also: examples/generate/multimodal/qwen2_5_omni/only_thinker.py
+         """
+-        return load_audio_pyav(self.video_path, sr=sampling_rate)[0]
++        return load_audio(self.video_path, sr=sampling_rate)[0]
+diff --git a/vllm/entrypoints/speech_to_text/transcription/protocol.py b/vllm/entrypoints/speech_to_text/transcription/protocol.py
+index abf1a11a0eea..b838ebedfac8 100644
+--- a/vllm/entrypoints/speech_to_text/transcription/protocol.py
++++ b/vllm/entrypoints/speech_to_text/transcription/protocol.py
+@@ -59,7 +59,11 @@ class TranscriptionRequest(OpenAIBaseModel):
+     file: UploadFile
+     """
+     The audio file object (not file name) to transcribe, in one of these
+-    formats: flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, or webm.
++    formats: flac, ogg, wav (reliably supported), or mp3/mpeg/mpga (only
++    when the deployed libsndfile build includes MP3 — soundfile >= 0.13
++    / libsndfile >= 1.1.0). AAC/MP4/M4A and WebM/Opus are not supported
++    following the royalty-bearing codec removal; re-encode to FLAC, OGG,
++    or WAV before submitting.
+     """
+ 
+     model: str | None = None
+diff --git a/vllm/entrypoints/speech_to_text/translation/protocol.py b/vllm/entrypoints/speech_to_text/translation/protocol.py
+index 6e457682c2f6..b66deafcc05d 100644
+--- a/vllm/entrypoints/speech_to_text/translation/protocol.py
++++ b/vllm/entrypoints/speech_to_text/translation/protocol.py
+@@ -57,7 +57,11 @@ class TranslationRequest(OpenAIBaseModel):
+     file: UploadFile
+     """
+     The audio file object (not file name) to translate, in one of these
+-    formats: flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, or webm.
++    formats: flac, ogg, wav (reliably supported), or mp3/mpeg/mpga (only
++    when the deployed libsndfile build includes MP3 — soundfile >= 0.13
++    / libsndfile >= 1.1.0). AAC/MP4/M4A and WebM/Opus are not supported
++    following the royalty-bearing codec removal; re-encode to FLAC, OGG,
++    or WAV before submitting.
+     """
+ 
+     model: str | None = None
+diff --git a/vllm/model_executor/models/nano_nemotron_vl.py b/vllm/model_executor/models/nano_nemotron_vl.py
+index 64667503d578..5840bb7ff1ec 100644
+--- a/vllm/model_executor/models/nano_nemotron_vl.py
++++ b/vllm/model_executor/models/nano_nemotron_vl.py
+@@ -53,7 +53,7 @@
+     MultiModalKwargsItems,
+     VideoItem,
+ )
+-from vllm.multimodal.media.audio import load_audio_pyav
++from vllm.multimodal.media.audio import load_audio
+ from vllm.multimodal.parse import (
+     AudioProcessorItems,
+     ImageEmbeddingItems,
+@@ -627,7 +627,7 @@ def _extract_audio_from_videos(
+                     "the chat API with a model that sets use_audio_in_video)."
+                 )
+             try:
+-                audio_items.append(load_audio_pyav(BytesIO(video_bytes)))
++                audio_items.append(load_audio(BytesIO(video_bytes)))
+                 has_audio.append(True)
+             except Exception:
+                 logger.debug(
+diff --git a/vllm/multimodal/audio.py b/vllm/multimodal/audio.py
+index 34bc177c8d53..bb6f1fa2341a 100644
+--- a/vllm/multimodal/audio.py
++++ b/vllm/multimodal/audio.py
+@@ -11,11 +11,6 @@
+ 
+ from vllm.utils.import_utils import PlaceholderModule
+ 
+-try:
+-    import av as av
+-except ImportError:
+-    av = PlaceholderModule("av")  # type: ignore[assignment]
+-
+ try:
+     import scipy.signal as scipy_signal
+ except ImportError:
+@@ -127,7 +122,17 @@ def normalize_audio(
+         raise ValueError(f"Unsupported audio shape: {audio.shape}. Expected 1D or 2D.")
+ 
+     # Auto-detect format: if shape[0] > shape[1], assume (time, channels)
+-    # This handles soundfile format where time dimension is typically much larger
++    # and transpose to (channels, time). This handles the soundfile layout
++    # where the time dimension is typically much larger than channels.
++    #
++    # KNOWN LIMITATION: this heuristic relies on `time >> channels`, which
++    # holds for any realistic audio (1-second mono at 16 kHz already has
++    # 16000 samples). It misfires only for pathological inputs where
++    # channels >= time samples — e.g. an 8-channel clip with <8 samples,
++    # or a perfectly square array. Such inputs are unreachable from the
++    # public audio decode paths but can occur in unit tests that synthesise
++    # tiny arrays — the square-array ambiguity is documented in the
++    # corresponding unit test suite for this module.
+     if audio.shape[0] > audio.shape[1]:
+         # Transpose from (time, channels) to (channels, time)
+         audio = audio.T if isinstance(audio, np.ndarray) else audio.T
+@@ -171,64 +176,6 @@ def normalize_audio(
+ # ============================================================
+ 
+ 
+-def resample_audio_pyav(
+-    audio: npt.NDArray[np.floating],
+-    *,
+-    orig_sr: float,
+-    target_sr: float,
+-) -> npt.NDArray[np.floating]:
+-    """Resample audio using PyAV (libswresample via FFmpeg).
+-
+-    Args:
+-        audio: Input audio. Can be:
+-            - 1D array ``(samples,)``: mono audio
+-            - 2D array ``(channels, samples)``: stereo audio
+-        orig_sr: Original sample rate in Hz.
+-        target_sr: Target sample rate in Hz.
+-
+-    Returns:
+-        Resampled audio with the same shape as the input (1D → 1D, 2D → 2D).
+-    """
+-    orig_sr_int = int(round(orig_sr))
+-    target_sr_int = int(round(target_sr))
+-
+-    if orig_sr_int == target_sr_int:
+-        return audio
+-
+-    if audio.ndim == 2:
+-        # Resample each channel independently and re-stack.
+-        return np.stack(
+-            [
+-                resample_audio_pyav(ch, orig_sr=orig_sr, target_sr=target_sr)
+-                for ch in audio
+-            ],
+-            axis=0,
+-        )
+-
+-    expected_len = int(math.ceil(audio.shape[-1] * target_sr_int / orig_sr_int))
+-
+-    # from_ndarray expects shape (channels, samples) for planar formats.
+-    # libswresample requires a minimum number of input samples to produce
+-    # output frames; pad short inputs with zeros so we always get output,
+-    # then trim to the expected output length.
+-    _MIN_SAMPLES = 1024
+-    audio_f32 = np.asarray(audio, dtype=np.float32)
+-    if len(audio_f32) < _MIN_SAMPLES:
+-        audio_f32 = np.pad(audio_f32, (0, _MIN_SAMPLES - len(audio_f32)))
+-    audio_f32 = audio_f32.reshape(1, -1)
+-
+-    resampler = av.AudioResampler(format="fltp", layout="mono", rate=target_sr_int)
+-
+-    frame = av.AudioFrame.from_ndarray(audio_f32, format="fltp", layout="mono")
+-    frame.sample_rate = orig_sr_int
+-
+-    out_frames = resampler.resample(frame)
+-    out_frames.extend(resampler.resample(None))  # flush buffered samples
+-
+-    result = np.concatenate([f.to_ndarray() for f in out_frames], axis=1).squeeze(0)
+-    return result[:expected_len]
+-
+-
+ def resample_audio_scipy(
+     audio: npt.NDArray[np.floating],
+     *,
+@@ -275,13 +222,24 @@ def resample_audio_soxr(
+ 
+ 
+ class AudioResampler:
+-    """Resample audio data to a target sample rate."""
++    """Resample audio data to a target sample rate.
++
++    Only the FFmpeg-free backends ``"scipy"`` and ``"soxr"`` are accepted
++    following the royalty-bearing codec removal (the former ``"pyav"``
++    backend required FFmpeg's libswresample). Validation happens at
++    construction time so an unsupported method is not silently ignored.
++    """
+ 
+     def __init__(
+         self,
+         target_sr: float | None = None,
+-        method: Literal["pyav", "scipy", "soxr"] = "pyav",
++        method: Literal["scipy", "soxr"] = "scipy",
+     ):
++        if method not in ("scipy", "soxr"):
++            raise ValueError(
++                f"Unsupported audio resample method {method!r}; "
++                "only 'scipy' and 'soxr' are supported."
++            )
+         self.target_sr = target_sr
+         self.method = method
+ 
+@@ -302,9 +260,7 @@ def resample(
+             abs_tol=1e-6,
+         ):
+             return audio
+-        if self.method == "pyav":
+-            return resample_audio_pyav(audio, orig_sr=orig_sr, target_sr=self.target_sr)
+-        elif self.method == "scipy":
++        if self.method == "scipy":
+             return resample_audio_scipy(
+                 audio, orig_sr=orig_sr, target_sr=self.target_sr
+             )
+@@ -313,7 +269,7 @@ def resample(
+         else:
+             raise ValueError(
+                 f"Invalid resampling method: {self.method}. "
+-                "Supported methods are 'pyav', 'scipy', and 'soxr'."
++                "Supported methods are 'scipy' and 'soxr'."
+             )
+ 
+ 
+@@ -421,9 +377,11 @@ def find_split_point(
+     """
+     segment = wav[start_idx:end_idx]
+ 
+-    # Calculate RMS energy in small windows
++    # Calculate RMS energy in small windows. If the search segment is
++    # shorter than `min_energy_window` the loop never executes — fall back
++    # to `start_idx` so the returned index stays inside the search range.
+     min_energy = math.inf
+-    quietest_idx = 0
++    quietest_idx = start_idx
+ 
+     for i in range(0, len(segment) - min_energy_window, min_energy_window):
+         window = segment[i : i + min_energy_window]
+diff --git a/vllm/multimodal/media/audio.py b/vllm/multimodal/media/audio.py
+index c9e5753ca78d..5c2a423aa440 100644
+--- a/vllm/multimodal/media/audio.py
++++ b/vllm/multimodal/media/audio.py
+@@ -1,6 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-import math
+ from io import BytesIO
+ from pathlib import Path
+ 
+@@ -10,20 +9,12 @@
+ import torch
+ 
+ import vllm.envs as envs
+-from vllm.logger import init_logger
+-from vllm.multimodal.audio import resample_audio_pyav
++from vllm.multimodal.audio import resample_audio_scipy
+ from vllm.utils.import_utils import PlaceholderModule
+ from vllm.utils.serial_utils import tensor2base64
+ 
+ from .base import MediaIO
+ 
+-logger = init_logger(__name__)
+-
+-try:
+-    import av
+-except ImportError:
+-    av = PlaceholderModule("av")  # type: ignore[assignment]
+-
+ try:
+     import soundfile
+ except ImportError:
+@@ -43,116 +34,6 @@
+ _BAD_SF_CODES = {0, 1, 3, 4}
+ 
+ 
+-def load_audio_pyav(
+-    path: BytesIO | Path | str,
+-    *,
+-    sr: float | None = 22050,
+-    mono: bool = True,
+-    max_duration_s: float | None = None,
+-) -> tuple[npt.NDArray, float]:
+-    """Load an audio file using PyAV (FFmpeg), returning float32 mono waveform.
+-
+-    Decodes the audio stream at its native sample rate. Channel reduction to
+-    mono is performed by averaging across channels.  Resampling to a
+-    model-specific rate is left to the downstream :class:`AudioResampler`.
+-
+-    Args:
+-        path: A :class:`~io.BytesIO` buffer, a filesystem
+-            :class:`~pathlib.Path`, or a string path.
+-        max_duration_s: If set, abort decoding once the accumulated
+-            sample count exceeds this many seconds of audio.  Prevents
+-            decompression-bomb attacks where a small compressed file
+-            expands into gigabytes of PCM.
+-
+-    Returns:
+-        ``(waveform, sample_rate)`` where *waveform* is a 1-D float32
+-        NumPy array and *sample_rate* is the native sample rate in Hz.
+-    """
+-    native_sr = None
+-    try:
+-        with av.open(path) as container:
+-            if not container.streams.audio:
+-                raise ValueError("No audio stream found.")
+-            stream = container.streams.audio[0]
+-            stream.thread_type = "AUTO"
+-            native_sr = stream.rate
+-            sr = sr or native_sr
+-
+-            # Early rejection from container/stream metadata to avoid
+-            # wasting resources on decoding decompression bombs.
+-            if max_duration_s is not None:
+-                metadata_duration_s = None
+-                if stream.duration and stream.time_base:
+-                    metadata_duration_s = float(stream.duration * stream.time_base)
+-                elif container.duration:
+-                    metadata_duration_s = container.duration / 1_000_000
+-                if (
+-                    metadata_duration_s is not None
+-                    and metadata_duration_s > max_duration_s
+-                ):
+-                    raise ValueError(
+-                        f"Audio exceeds maximum allowed duration of "
+-                        f"{max_duration_s}s (metadata reports "
+-                        f"{metadata_duration_s:.1f}s). Set "
+-                        f"VLLM_MAX_AUDIO_DECODE_DURATION_S to "
+-                        f"increase this limit."
+-                    )
+-
+-            max_samples = (
+-                int(sr * max_duration_s) if max_duration_s is not None else None
+-            )
+-            total_samples = 0
+-
+-            chunks: list[npt.NDArray] = []
+-            needs_resampling = not math.isclose(
+-                float(sr),
+-                float(native_sr),
+-                rel_tol=0.0,
+-                abs_tol=1e-6,
+-            )
+-            resampler = (
+-                av.AudioResampler(format="fltp", layout="mono", rate=sr)
+-                if needs_resampling
+-                else None
+-            )
+-            for frame in container.decode(stream):
+-                if needs_resampling:
+-                    assert resampler is not None
+-                    for out_frame in resampler.resample(frame):
+-                        arr = out_frame.to_ndarray()
+-                        total_samples += arr.shape[-1]
+-                        chunks.append(arr)
+-                else:
+-                    arr = frame.to_ndarray()
+-                    total_samples += arr.shape[-1]
+-                    chunks.append(arr)
+-
+-                if max_samples is not None and total_samples > max_samples:
+-                    raise ValueError(
+-                        f"Audio exceeds maximum allowed duration of "
+-                        f"{max_duration_s}s (decoded {total_samples} "
+-                        f"samples at {sr}Hz). Set "
+-                        f"VLLM_MAX_AUDIO_DECODE_DURATION_S to "
+-                        f"increase this limit."
+-                    )
+-    except (ValueError, ImportError):
+-        raise
+-    except Exception as e:
+-        raise ValueError(
+-            "Invalid or corrupted video data when extracting audio. "
+-            "Ensure the input is valid video bytes (e.g. a complete MP4)."
+-        ) from e
+-
+-    if not chunks:
+-        raise ValueError("No audio found in the video.")
+-
+-    audio = np.concatenate(chunks, axis=-1).astype(np.float32)
+-    if mono and audio.ndim > 1:
+-        audio = np.mean(audio, axis=0)
+-
+-    return audio, sr
+-
+-
+ def load_audio_soundfile(
+     path: BytesIO | Path | str,
+     *,
+@@ -175,12 +56,17 @@ def load_audio_soundfile(
+                 )
+         y = f.read(dtype="float32", always_2d=False).T
+ 
++    # After `.T`, any 2D input is already (channels, time), so the channels
++    # axis is always axis=0. The previous `tuple(range(y.ndim - 1))` form
++    # was equivalent but harder to read.
+     if mono and y.ndim > 1:
+-        y = np.mean(y, axis=tuple(range(y.ndim - 1)))
++        y = np.mean(y, axis=0)
+ 
+     if sr is not None and sr != native_sr:
+-        y = resample_audio_pyav(y, orig_sr=native_sr, target_sr=sr)
+-        return y, int(sr)
++        y = resample_audio_scipy(y, orig_sr=native_sr, target_sr=sr)
++        # Round to match the rounding used inside `resample_audio_scipy`
++        # itself, so half-integer rates don't silently truncate.
++        return y, int(round(sr))
+     return y, native_sr
+ 
+ 
+@@ -191,31 +77,33 @@ def load_audio(
+     mono: bool = True,
+     max_duration_s: float | None = None,
+ ):
++    """Load audio from a file or buffer via soundfile (FFmpeg-free).
++
++    Reliably supports WAV, FLAC, OGG/Vorbis, and other formats native to
++    libsndfile. MP3 works on libsndfile >= 1.1.0 (soundfile >= 0.13) but
++    not all packaged wheels are built with MP3 support. AAC/MP4/M4A and
++    WebM/Opus container formats are not supported following the
++    royalty-bearing codec removal; re-encode to FLAC, OGG, or WAV.
++    """
+     try:
+         return load_audio_soundfile(
+             path, sr=sr, mono=mono, max_duration_s=max_duration_s
+         )
+-    except ImportError as exc:
+-        # soundfile (or resampy) is not installed — fall through to pyav.
+-        # NOTE: this clause must stay BEFORE ``soundfile.LibsndfileError``
+-        # because when soundfile is a PlaceholderModule, evaluating
+-        # ``soundfile.LibsndfileError`` itself raises ImportError.
+-        logger.error("Failed to load audio via soundfile: %r", exc)
++    except ImportError:
++        raise  # Let PlaceholderModule's message ("install vllm[audio]") propagate.
+     except soundfile.LibsndfileError as exc:
+-        # Only fall back for known format-detection failures.
+-        # Re-raise anything else (e.g. corrupt but recognised format).
+         if exc.code not in _BAD_SF_CODES:
+             raise
+-    # soundfile may have advanced the BytesIO seek position before failing;
+-    # reset it so PyAV can read from the beginning.
+-    if isinstance(path, BytesIO):
+-        path.seek(0)
+-    try:
+-        return load_audio_pyav(path, sr=sr, mono=mono, max_duration_s=max_duration_s)
+-    except ImportError:
+-        raise  # Let PlaceholderModule's message ("install vllm[audio]") propagate.
+-    except Exception as pyav_exc:
+-        raise ValueError("Invalid or unsupported audio file.") from pyav_exc
++        raise ValueError(
++            "Invalid or unsupported audio format. "
++            "Reliably supported by this build: WAV, FLAC, OGG/Vorbis "
++            "(MP3 is libsndfile-build dependent — present in soundfile >= "
++            "0.13 / libsndfile >= 1.1.0 but not all packaged wheels). "
++            "AAC/MP4/M4A and WebM/Opus container formats were previously "
++            "accepted via PyAV/FFmpeg but are no longer supported following "
++            "the royalty-bearing codec removal — re-encode to WAV, FLAC, "
++            "or OGG/Vorbis before submitting."
++        ) from exc
+ 
+ 
+ class AudioMediaIO(MediaIO[tuple[npt.NDArray, float]]):
+diff --git a/vllm/multimodal/parse.py b/vllm/multimodal/parse.py
+index 0cce4b26613b..08d9cfaf071c 100644
+--- a/vllm/multimodal/parse.py
++++ b/vllm/multimodal/parse.py
+@@ -508,7 +508,7 @@ def __init__(
+         *,
+         target_sr: float | None = None,
+         target_channels: int | None = None,
+-        audio_resample_method: Literal["pyav", "scipy", "soxr"] = "pyav",
++        audio_resample_method: Literal["scipy", "soxr"] = "scipy",
+         video_needs_metadata: bool = False,
+         expected_hidden_size: int | None = None,
+     ) -> None:
+diff --git a/vllm/multimodal/video.py b/vllm/multimodal/video.py
+index 4a82dd24e757..89b2cc4e1cc1 100644
+--- a/vllm/multimodal/video.py
++++ b/vllm/multimodal/video.py
+@@ -20,11 +20,6 @@
+     cv2 = PlaceholderModule("cv2")
+     vr = PlaceholderModule("cv2").placeholder_attr("videoio_registry")
+ 
+-try:
+-    import av
+-except ImportError:
+-    av = PlaceholderModule("av")  # type: ignore[assignment]
+-
+ 
+ logger = init_logger(__name__)
+ 
+@@ -415,85 +410,14 @@ def read_frames(
+         return frames, valid_frame_indices
+ 
+ 
+-class PyAVVideoBackendMixin:
+-    """PyAV (in-process FFmpeg bindings) codec utilities.
+-
+-    Reads stream metadata and decodes target frames via per-frame
+-    ``container.seek()``. The seek releases the GIL between frames and
+-    scales with the number of sampled frames rather than the video
+-    length, enabling concurrent decoding under serving load.
+-    """
+-
+-    @staticmethod
+-    def get_metadata(
+-        container: "av.container.InputContainer",
+-    ) -> VideoSourceMetadata:
+-        if not container.streams.video:
+-            raise ValueError("No video streams found in container")
+-        stream = container.streams.video[0]
+-        total_frames = stream.frames or 0
+-        fps = float(stream.average_rate) if stream.average_rate else 0.0
+-        duration = float(stream.duration * stream.time_base) if stream.duration else 0.0
+-        if total_frames == 0 and duration > 0 and fps > 0:
+-            total_frames = int(duration * fps)
+-        return VideoSourceMetadata(total_frames, fps, duration)
+-
+-    @staticmethod
+-    def decode_frames(
+-        container: "av.container.InputContainer",
+-        frame_indices: list[int],
+-        fps: float,
+-        duration: float,
+-    ) -> tuple[npt.NDArray, list[int]]:
+-        """Decode target frames via per-frame seek + forward decode to PTS."""
+-        stream = container.streams.video[0]
+-        # SLICE parallelizes within a single frame without the
+-        # one-frame-per-thread latency penalty of FRAME threading.
+-        stream.thread_type = "SLICE"
+-        time_base = stream.time_base
+-
+-        frames_list: list[npt.NDArray] = []
+-        valid_indices: list[int] = []
+-        frame_interval = 1.0 / fps if fps > 0 else 0.1
+-        max_ts = max(0.0, duration - frame_interval) if duration > 0 else float("inf")
+-
+-        decoder = None
+-        last_pts = None
+-        for idx in frame_indices:
+-            ts = min(idx / fps, max_ts) if fps > 0 else 0.0
+-            pts = int(ts / time_base)
+-            # seek() snaps backward to a keyframe; reuse the running decoder
+-            # while targets advance monotonically to avoid re-decoding the
+-            # GOP prefix once per requested frame.
+-            if decoder is None or last_pts is None or pts <= last_pts:
+-                container.seek(pts, stream=stream)
+-                decoder = container.decode(video=0)
+-            chosen = None
+-            for frame in decoder:
+-                if frame.pts is not None and frame.pts >= pts:
+-                    chosen = frame
+-                    last_pts = frame.pts
+-                    break
+-            if chosen is not None:
+-                frames_list.append(chosen.to_ndarray(format="rgb24"))
+-                valid_indices.append(idx)
+-            else:
+-                decoder = None
+-
+-        if not frames_list:
+-            return np.empty((0,), dtype=np.uint8), valid_indices
+-        return np.stack(frames_list), valid_indices
+-
+-
+ @VIDEO_LOADER_REGISTRY.register("opencv")
+-class VideoBackend(VideoLoader, OpenCVVideoBackendMixin, PyAVVideoBackendMixin):
++class VideoBackend(VideoLoader, OpenCVVideoBackendMixin):
+     """Uniform-sampling video backend.
+ 
+     Samples ``num_frames`` uniformly across the video (or one frame every
+-    ``1/fps`` seconds, whichever produces fewer frames). The decoding codec
+-    is selected via the ``backend`` kwarg (``"opencv"`` or ``"pyav"``),
+-    which can be passed through ``--media-io-kwargs``. Defaults to
+-    ``"pyav"`` for concurrent decoding.
++    ``1/fps`` seconds, whichever produces fewer frames). Uses OpenCV as the
++    decoder; royalty-bearing codec backends (PyAV/FFmpeg-direct) have been
++    removed.
+     """
+ 
+     _sampling_suffix: ClassVar[str] = ""
+@@ -538,7 +462,7 @@ def load_bytes(
+         max_duration: int = 300,
+         frame_recovery: bool = False,
+         *,
+-        backend: Literal["opencv", "pyav"] = "opencv",
++        backend: Literal["opencv"] = "opencv",
+         **kwargs,
+     ) -> tuple[npt.NDArray, dict[str, Any]]:
+         """Load sampled frames from raw video bytes.
+@@ -550,45 +474,31 @@ def load_bytes(
+             max_duration: Maximum duration in seconds — only used by the
+                 dynamic subclass; ignored here.
+             frame_recovery: Enable forward-scan recovery for failed frames.
+-                Only honored by the OpenCV codec.
+-            backend: Decoding codec — ``"opencv"`` or ``"pyav"`` .
++            backend: Decoding codec — only ``"opencv"`` is supported.
+ 
+         Returns:
+             Tuple of ``(frames_array, metadata_dict)``.
+         """
++        if backend != "opencv":
++            raise ValueError(
++                f"Unknown video codec backend {backend!r}; only 'opencv' is supported."
++            )
++
+         target = VideoTargetMetadata(
+             num_frames=num_frames, fps=fps, max_duration=max_duration
+         )
+ 
+-        if backend == "opencv":
+-            cap = cls.open_video_capture(data)
+-            source = cls._prepare_source(cls.get_video_metadata(cap))
+-            frame_idx = cls.compute_frames_index_to_sample(
+-                source=source, target=target, **kwargs
+-            )
+-            frames, valid = cls.read_frames(
+-                cap,
+-                frame_idx,
+-                total_frames_num=source.total_frames_num,
+-                frame_recovery=frame_recovery,
+-            )
+-        elif backend == "pyav":
+-            assert not frame_recovery, (
+-                "frame_recovery is only available for `opencv` backend"
+-            )
+-            with av.open(BytesIO(data)) as container:
+-                source = cls._prepare_source(cls.get_metadata(container))
+-                frame_idx = cls.compute_frames_index_to_sample(
+-                    source=source, target=target, **kwargs
+-                )
+-                frames, valid = cls.decode_frames(
+-                    container, frame_idx, source.original_fps, source.duration
+-                )
+-        else:
+-            raise ValueError(
+-                f"Unknown video codec backend {backend!r}; "
+-                "valid options: 'opencv', 'pyav'."
+-            )
++        cap = cls.open_video_capture(data)
++        source = cls._prepare_source(cls.get_video_metadata(cap))
++        frame_idx = cls.compute_frames_index_to_sample(
++            source=source, target=target, **kwargs
++        )
++        frames, valid = cls.read_frames(
++            cap,
++            frame_idx,
++            total_frames_num=source.total_frames_num,
++            frame_recovery=frame_recovery,
++        )
+ 
+         if len(valid) < len(frame_idx):
+             logger.warning(
+@@ -640,7 +550,7 @@ def load_bytes(
+         max_duration: int = 300,
+         frame_recovery: bool = False,
+         *,
+-        backend: Literal["opencv", "pyav"] = "opencv",
++        backend: Literal["opencv"] = "opencv",
+         **kwargs,
+     ) -> tuple[npt.NDArray, dict[str, Any]]:
+         return super().load_bytes(
+@@ -719,7 +629,7 @@ def load_bytes(
+         max_duration: int = 300,
+         frame_recovery: bool = False,
+         *,
+-        backend: Literal["opencv", "pyav"] = "opencv",
++        backend: Literal["opencv"] = "opencv",
+         **kwargs,
+     ) -> tuple[npt.NDArray, dict[str, Any]]:
+         return super().load_bytes(
+@@ -811,7 +721,7 @@ def load_bytes(
+         max_duration: int = 300,
+         frame_recovery: bool = False,
+         *,
+-        backend: Literal["opencv", "pyav"] = "opencv",
++        backend: Literal["opencv"] = "opencv",
+         **kwargs,
+     ) -> tuple[npt.NDArray, dict[str, Any]]:
+         return super().load_bytes(
+@@ -937,7 +847,7 @@ def load_bytes(
+         max_duration: int = 300,
+         frame_recovery: bool = False,
+         *,
+-        backend: Literal["opencv", "pyav"] = "opencv",
++        backend: Literal["opencv"] = "opencv",
+         **kwargs,
+     ) -> tuple[npt.NDArray, dict[str, Any]]:
+         return super().load_bytes(
+@@ -1036,7 +946,7 @@ def load_bytes(
+         max_duration: int = 300,
+         frame_recovery: bool = False,
+         *,
+-        backend: Literal["opencv", "pyav"] = "opencv",
++        backend: Literal["opencv"] = "opencv",
+         **kwargs,
+     ) -> tuple[npt.NDArray, dict[str, Any]]:
+         frames, metadata = super().load_bytes(
+@@ -1355,7 +1265,7 @@ def load_bytes(
+         max_duration: int = 300,
+         frame_recovery: bool = False,
+         *,
+-        backend: Literal["opencv", "pyav"] = "opencv",
++        backend: Literal["opencv"] = "opencv",
+         **kwargs,
+     ) -> tuple[npt.NDArray, dict[str, Any]]:
+         frames, metadata = super().load_bytes(

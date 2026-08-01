@@ -1,0 +1,365 @@
+From eebcf1defa580b8d0cb538cb70147f2cb8844a52 Mon Sep 17 00:00:00 2001
+From: Andrii <askliar@nvidia.com>
+Date: Tue, 12 May 2026 13:34:54 +0000
+Subject: [PATCH] add nemotron_3_5_fixes
+
+(cherry picked from commit 1ce5f68aaeadfb1f7fb90add3d018034f10b40a4)
+(cherry picked from commit 569f88312631e09e3f81c8a5239da88e78d7401b)
+---
+ tests/kernels/moe/test_flashinfer_b12x_moe.py |  2 +-
+ vllm/envs.py                                  | 11 +++
+ .../fused_moe/experts/flashinfer_b12x_moe.py  | 69 ++++++++++++-------
+ .../layers/quantization/modelopt.py           | 19 +++++
+ .../quantization/utils/flashinfer_fp4_moe.py  |  3 +
+ .../quantization/utils/marlin_utils_fp4.py    |  6 +-
+ .../layers/vocab_parallel_embedding.py        | 14 ++--
+ vllm/model_executor/models/nemotron_h_mtp.py  | 33 +++++++++
+ vllm/model_executor/models/qwen3_5_mtp.py     | 22 ++++++
+ 9 files changed, 148 insertions(+), 31 deletions(-)
+
+diff --git a/tests/kernels/moe/test_flashinfer_b12x_moe.py b/tests/kernels/moe/test_flashinfer_b12x_moe.py
+index 839d3c420472..9e42daa8b96c 100644
+--- a/tests/kernels/moe/test_flashinfer_b12x_moe.py
++++ b/tests/kernels/moe/test_flashinfer_b12x_moe.py
+@@ -61,7 +61,7 @@ def _reorder_gate_up_to_up_gate(
+ 
+     The B12x kernel expects weights in [up (w3), gate (w1)] order while the
+     BF16 reference uses [gate (w1), up (w3)].  This replicates the reordering
+-    done at model-load time by ``prepare_nvfp4_moe_layer_for_fi_or_cutlass``.
++    done at model-load time by the FP4 layer-prep helper.
+     """
+     n = w.shape[1] // 2
+     return (
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 9e685364f120..7b97cdc3efd1 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -202,6 +202,7 @@
+     ) = None
+     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
+     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
++    VLLM_FLASHINFER_B12X_ACTIVATION_PRECISION: Literal["fp4", "bf16"] = "fp4"
+     VLLM_XGRAMMAR_CACHE_MB: int = 0
+     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
+     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
+@@ -1571,6 +1572,16 @@ def _resolve_rust_frontend_path() -> str | None:
+     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
+         os.getenv("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", str(394 * 1024 * 1024))
+     ),
++    # Intermediate activation precision for the B12x SM12x MoE wrapper:
++    # "fp4" (W4A4, default) re-quantizes the post-SwiGLU/ReLU2 activations
++    # to FP4 before the FC2 GEMM; "bf16" (W4A16) keeps them in BF16 and
++    # dequantizes weights instead. Same NVFP4 weight bytes for both —
++    # the kernel chooses internally.
++    "VLLM_FLASHINFER_B12X_ACTIVATION_PRECISION": env_with_choices(
++        "VLLM_FLASHINFER_B12X_ACTIVATION_PRECISION",
++        "fp4",
++        ["fp4", "bf16"],
++    ),
+     # Control the maximum number of tokens per expert supported by the
+     # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for
+     # the blockscale tensor of activations NVFP4 Quantization.
+diff --git a/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py b/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py
+index 86f1fb958839..7d6256ac8558 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py
+@@ -17,6 +17,8 @@
+     QuantKey,
+     kNvfp4Dynamic,
+     kNvfp4Static,
++    kNvfp4StaticGroupScale,
++    kStaticTensorScale,
+ )
+ from vllm.platforms import current_platform
+ from vllm.utils.flashinfer import (
+@@ -83,8 +85,13 @@ def __init__(
+             )
+         self._activation_str = self._ACTIVATION_MAP[activation]
+ 
++        self.activation_precision = (
++            "fp4" if quant_config.a1_gscale is not None else "bf16"
++        )
++
+         # Lazily created on first apply() call.
+-        self._wrapper: Any | None = None
++        self._wrapper: object | None = None
++        # Populated in process_weights_after_loading.
+         self.w1_sf_mma: torch.Tensor | None = None
+         self.w2_sf_mma: torch.Tensor | None = None
+ 
+@@ -132,26 +139,27 @@ def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+                 dtype=torch.float32,
+             )
+ 
+-        # Precompute MMA-layout views of the weight scale factors once here
+-        # rather than recomputing on every forward pass.
+-        assert self.w1_scale is not None
+-        num_experts_w1, m1, k1_sf = self.w1_scale.shape
+-        k1 = k1_sf * 16
++        # Precompute MMA-layout views of the (now-rewritten) weight scale
++        # factors once here rather than recomputing on every forward pass.
++        # Converts swizzled 3D scale factors [E, M, K_sf] to the 6D MMA
++        # layout expected by the SM12x kernel's _get_weight_views().
++        assert self.w1_scale is not None and self.w2_scale is not None
++        sf_vec_size = 16
++        E_w1, M_w1, K_sf_w1 = self.w1_scale.shape
+         self.w1_sf_mma = flashinfer_convert_sf_to_mma_layout(
+-            self.w1_scale.reshape(num_experts_w1 * m1, k1_sf),
+-            m=m1,
+-            k=k1,
+-            num_groups=num_experts_w1,
++            self.w1_scale.reshape(E_w1 * M_w1, K_sf_w1),
++            m=M_w1,
++            k=K_sf_w1 * sf_vec_size,
++            num_groups=E_w1,
++            sf_vec_size=sf_vec_size,
+         )
+-
+-        assert self.w2_scale is not None
+-        num_experts_w2, m2, k2_sf = self.w2_scale.shape
+-        k2 = k2_sf * 16
++        E_w2, M_w2, K_sf_w2 = self.w2_scale.shape
+         self.w2_sf_mma = flashinfer_convert_sf_to_mma_layout(
+-            self.w2_scale.reshape(num_experts_w2 * m2, k2_sf),
+-            m=m2,
+-            k=k2,
+-            num_groups=num_experts_w2,
++            self.w2_scale.reshape(E_w2 * M_w2, K_sf_w2),
++            m=M_w2,
++            k=K_sf_w2 * sf_vec_size,
++            num_groups=E_w2,
++            sf_vec_size=sf_vec_size,
+         )
+ 
+     @staticmethod
+@@ -176,13 +184,23 @@ def _supports_quant_scheme(
+         weight_key: QuantKey | None,
+         activation_key: QuantKey | None,
+     ) -> bool:
+-        # b12x performs in-kernel BF16->FP4 activation quant, so W4A16
+-        # NVFP4 checkpoints (activation_key=None, e.g. mixed-precision
+-        # compressed-tensors layouts) are runtime-compatible.
+-        return (weight_key, activation_key) in (
+-            (kNvfp4Static, kNvfp4Dynamic),
+-            (kNvfp4Static, None),
+-        )
++        # Original W4A4 NVFP4 (modelopt format).
++        if (weight_key, activation_key) == (kNvfp4Static, kNvfp4Dynamic):
++            return True
++
++        # W4A16 NVFP4 compressed-tensors `nvfp4-pack-quantized`.
++        # (askliar #43333: compressed-tensors layout has explicit weight
++        # spec but activation_key=None.)
++        if (
++            weight_key is not None
++            and weight_key.dtype == torch.uint8
++            and weight_key.scale == kNvfp4StaticGroupScale
++            and weight_key.scale2 == kStaticTensorScale
++            and weight_key.symmetric
++            and activation_key is None
++        ):
++            return True
++        return False
+ 
+     @staticmethod
+     def _supports_activation(activation: MoEActivation) -> bool:
+@@ -239,6 +257,7 @@ def _ensure_wrapper(self) -> None:
+             max_num_tokens=self.max_num_tokens,
+             num_local_experts=self.num_local_experts,
+             activation=self._activation_str,
++            activation_precision=self.activation_precision,
+         )
+ 
+     def apply(
+diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
+index d51a2dd312af..033d533f2cdc 100644
+--- a/vllm/model_executor/layers/quantization/modelopt.py
++++ b/vllm/model_executor/layers/quantization/modelopt.py
+@@ -52,6 +52,7 @@
+     LinearMethodBase,
+     UnquantizedLinearMethod,
+ )
++from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+ from vllm.model_executor.layers.quantization import QuantizationMethods
+ from vllm.model_executor.layers.quantization.base_config import (
+     QuantizationConfig,
+@@ -2406,6 +2407,24 @@ def _resolve_quant_algo(self, prefix: str) -> str | None:
+             if candidate in self.quantized_layers:
+                 return self.quantized_layers[candidate]["quant_algo"].upper()
+ 
++        # Qwen VLM wrappers can construct the LM head under a nested vLLM
++        # prefix while ModelOpt exports the tensor names as top-level lm_head.*.
++        if prefix.endswith(".lm_head") and "lm_head" in self.quantized_layers:
++            return self.quantized_layers["lm_head"]["quant_algo"].upper()
++
++        # Qwen3.5/3.6-MoE VLM: vLLM's internal naming can be
++        # language_model.model.layers.X... while ModelOpt exports keys as
++        # model.language_model.layers.X... (swapped wrapper order). Try the
++        # swap as a direct fallback for any prefix that does not match.
++        if prefix.startswith("language_model.model."):
++            swapped = "model.language_model." + prefix[len("language_model.model.") :]
++            if swapped in self.quantized_layers:
++                return self.quantized_layers[swapped]["quant_algo"].upper()
++        elif prefix.startswith("model.language_model."):
++            swapped = "language_model.model." + prefix[len("model.language_model.") :]
++            if swapped in self.quantized_layers:
++                return self.quantized_layers[swapped]["quant_algo"].upper()
++
+         # 2. Packed / fused layer lookup
+         proj_name = prefix.rsplit(".", 1)[-1]
+         if self.packed_modules_mapping and proj_name in self.packed_modules_mapping:
+diff --git a/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py b/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py
+index 23a7131a582a..655168756728 100644
+--- a/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py
++++ b/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py
+@@ -373,5 +373,8 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
+             w2_scale = torch.nn.functional.pad(w2_scale, (0, pad_size // 16))
+ 
+         w2_scale = swizzle_blockscale(w2_scale)
++        layer.moe_config.intermediate_size_per_partition = (
++            layer.moe_config.intermediate_size_per_partition + pad_size
++        )
+ 
+     return w13, w13_scale, w13_scale_2, a13_scale, w2, w2_scale, w2_scale_2, a2_scale
+diff --git a/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py b/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
+index 35a335ac80bc..be70189d8520 100644
+--- a/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
++++ b/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
+@@ -233,7 +233,11 @@ def prepare_fp4_layer_for_marlin(
+     part_size_n = layer.output_size_per_partition
+     part_size_k = layer.input_size_per_partition
+     padded_n, padded_k = marlin_padded_nk(part_size_n, part_size_k, group_size)
+-    param_dtype = layer.params_dtype
++    # VocabParallelEmbedding / ParallelLMHead does not store params_dtype as an
++    # attribute
++    param_dtype = getattr(layer, "params_dtype", None)
++    if param_dtype is None:
++        param_dtype = torch.get_default_dtype()
+ 
+     assert layer.weight.shape == (part_size_n, part_size_k // 2)
+ 
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index 61f33591b8ca..ffb58069f450 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -434,12 +434,18 @@ def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+         # If parameter does not have output dim, then it should
+         # be copied onto all gpus (e.g. g_idx for act_order gptq).
+         if output_dim is None:
++            # AutoQuantize-quantized lm_head emits FP4 scalar scales
++            # (input_scale, weight_scale_2). Their on-disk shape is () while
++            # PerTensorScaleParameter materializes them as (1,) (same numel,
++            # different rank). Reshape rather than asserting.
++            # (askliar #43333: broader than the earlier 0-dim-only handling
++            # on HEAD, which is now subsumed by the numel-match check.)
+             if (
+-                loaded_weight.ndim == 0
+-                and param.data.ndim == 1
+-                and param.data.numel() == 1
++                param.data.shape != loaded_weight.shape
++                and param.data.numel() == loaded_weight.numel()
+             ):
+-                loaded_weight = loaded_weight.reshape(1)
++                param.data.copy_(loaded_weight.reshape(param.data.shape))
++                return
+             assert param.data.shape == loaded_weight.shape
+             param.data.copy_(loaded_weight)
+             return
+diff --git a/vllm/model_executor/models/nemotron_h_mtp.py b/vllm/model_executor/models/nemotron_h_mtp.py
+index fe737438c30f..1f0693c5ae5e 100644
+--- a/vllm/model_executor/models/nemotron_h_mtp.py
++++ b/vllm/model_executor/models/nemotron_h_mtp.py
+@@ -11,6 +11,7 @@
+ from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import CacheConfig, ModelConfig, VllmConfig
+ from vllm.config.parallel import ParallelConfig
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe import (
+     fused_moe_make_expert_params_mapping,
+ )
+@@ -36,6 +37,8 @@
+     NemotronHMoEDecoderLayer,
+ )
+ 
++logger = init_logger(__name__)
++
+ 
+ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
+     def __init__(
+@@ -242,6 +245,35 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+ 
+         # Total number of physical layers = num_steps * pattern_len
+         total_layers = self.num_mtp_layers * self.pattern_len
++
++        quant_config = vllm_config.quant_config
++        if (
++            quant_config is not None
++            and quant_config.get_name() == "compressed-tensors"
++            and hasattr(quant_config, "ignore")
++        ):
++            num_experts = getattr(config, "n_routed_experts", None)
++            if getattr(config, "model_type", None) == "nemotron_h_puzzle":
++                num_experts = getattr(config, "mtp_n_routed_experts", num_experts)
++            if num_experts:
++                extra: list[str] = []
++                for i in range(total_layers):
++                    if self.pattern_str[i % self.pattern_len] != "E":
++                        continue
++                    for eid in range(num_experts):
++                        for proj in ("gate_proj", "up_proj", "down_proj"):
++                            extra.append(
++                                f"{prefix}.layers.{i}.mixer.experts.{eid}.{proj}"
++                            )
++                new_entries = [n for n in extra if n not in quant_config.ignore]
++                quant_config.ignore.extend(new_entries)
++                if new_entries:
++                    logger.info(
++                        "NemotronH-MTP: extended compressed-tensors ignore "
++                        "with %d per-expert MTP linears (BF16 in the checkpoint)",
++                        len(new_entries),
++                    )
++
+         for i in range(total_layers):
+             step_rel_idx = i % self.pattern_len
+ 
+@@ -346,6 +378,7 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         self.lm_head = ParallelLMHead(
+             self.config.vocab_size,
+             self.config.hidden_size,
++            quant_config=self.quant_config,
+             prefix=maybe_prefix(prefix, "lm_head"),
+         )
+ 
+diff --git a/vllm/model_executor/models/qwen3_5_mtp.py b/vllm/model_executor/models/qwen3_5_mtp.py
+index 021462f3ee57..e1989d7489d0 100644
+--- a/vllm/model_executor/models/qwen3_5_mtp.py
++++ b/vllm/model_executor/models/qwen3_5_mtp.py
+@@ -97,6 +97,28 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+             prefix=f"{prefix}.fc",
+         )
+ 
++        if (
++            quant_config is not None
++            and quant_config.get_name() == "compressed-tensors"
++            and hasattr(quant_config, "ignore")
++        ):
++            num_experts = getattr(config, "num_experts", 0)
++            extra: list[str] = []
++            for idx in range(self.num_mtp_layers):
++                for eid in range(num_experts):
++                    for proj in ("gate_proj", "up_proj", "down_proj"):
++                        extra.append(
++                            f"{prefix}.layers.{idx}.mlp.experts.{eid}.{proj}"
++                        )
++            new_entries = [n for n in extra if n not in quant_config.ignore]
++            quant_config.ignore.extend(new_entries)
++            if new_entries:
++                logger.info(
++                    "Qwen3_5MTP: extended compressed-tensors ignore with "
++                    "%d per-expert MTP linears (BF16 in the checkpoint)",
++                    len(new_entries),
++                )
++
+         self.layers = torch.nn.ModuleList(
+             Qwen3_5DecoderLayer(
+                 vllm_config,

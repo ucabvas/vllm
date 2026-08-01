@@ -1,0 +1,39 @@
+From 80b6fe3d17f1207a9473161c01fe97fc78d7688d Mon Sep 17 00:00:00 2001
+From: Junhao Shen <junshen@nvidia.com>
+Date: Mon, 20 Oct 2025 21:29:18 +0800
+Subject: [PATCH] add thor sm110 support
+
+Signed-off-by: Stefano Castagnetta <scastagnetta@nvidia.com>
+(cherry picked from commit cab21faade03411fcc067cf90d3df91b2207b2fa)
+(cherry picked from commit 18675cea26465f3d20b21d8a4ba7363319338d04)
+(cherry picked from commit baab71f5a22ca62eaf13c8074ae788b9f1d6b35a)
+---
+ CMakeLists.txt        | 2 +-
+ requirements/cuda.txt | 1 -
+ 2 files changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 36b8e66f2c64..292551960c89 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -112,7 +112,7 @@ if(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
+   set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0")
+ elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
+    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
+-  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;12.0;12.1")
++  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;11.0;12.0;12.1")
+ else()
+   set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.7;8.9;9.0")
+ endif()
+diff --git a/requirements/cuda.txt b/requirements/cuda.txt
+index b938d2e28ff9..65560c8040a4 100644
+--- a/requirements/cuda.txt
++++ b/requirements/cuda.txt
+@@ -7,7 +7,6 @@ numba # Required for N-gram speculative decoding
+ # in NVIDIA branches, torch/torchvision/torchaudio (and anything that depends on PyT)
+ # should remain unpinned, as we build them ourselves at all matching versions
+ torch
+-torchaudio
+ torchvision  # Required for phi3v processor. See https://github.com/pytorch/vision?tab=readme-ov-file#installation for corresponding version
+ flashinfer-python  # version controlled by Dockerfile.pip wheel image
+ flashinfer-cubin  # version controlled by Dockerfile.pip wheel image

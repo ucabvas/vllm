@@ -1,0 +1,40 @@
+From a06b0b50100123e65408990fc0f017dfb50fb22f Mon Sep 17 00:00:00 2001
+From: Stefano Castagnetta <scastagnetta@nvidia.com>
+Date: Thu, 23 Apr 2026 12:43:46 +0200
+Subject: [PATCH] Drop duplicate ArchTag declaration now subsumed by upstream
+ #38423
+
+Commit 3c1c66825 (26.03 Spark fixes) added `using ArchTag = arch::Sm90;`
+to MacheteCollectiveMma::DispatchPolicy as part of the SM121 (GB10/Spark)
+enablement work. Upstream PR #38423 "[NVIDIA] Bugfix NVFP4 DGX Spark and
+RTX50" added the identical declaration to the same struct, and that PR is
+in v0.20.0. Rebasing our patch on top of v0.20.0 produces two identical
+declarations which nvcc rejects with 'redeclaration of using ArchTag'.
+
+The upstream line is sufficient for the IsSm120Family check that our
+comment referenced, so drop our duplicate and its comment. The rest of
+commit 3c1c66825 is still required (SM12x software E2M1, enable_sm120_family,
+Marlin SM12x broadening, test API updates) because none of those hunks
+made it upstream in v0.20.0.
+
+Signed-off-by: Stefano Castagnetta <scastagnetta@nvidia.com>
+(cherry picked from commit a8add7675607c5013e13b4b071e59f40607bcab4)
+(cherry picked from commit 618d89d5ccd8806b7dee1310ea22c681f59be447)
+(cherry picked from commit ac96f2f08dcca48fa749efb9c5a735328d209186)
+---
+ csrc/libtorch_stable/quantization/machete/machete_mainloop.cuh | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/csrc/libtorch_stable/quantization/machete/machete_mainloop.cuh b/csrc/libtorch_stable/quantization/machete/machete_mainloop.cuh
+index c879836f040a..a0d1ded8876a 100644
+--- a/csrc/libtorch_stable/quantization/machete/machete_mainloop.cuh
++++ b/csrc/libtorch_stable/quantization/machete/machete_mainloop.cuh
+@@ -156,8 +156,6 @@ struct MacheteCollectiveMma {
+     using ClusterShape = ClusterShape_MNK;
+     using ArchTag = arch::Sm90;
+     using Schedule = KernelScheduleType;
+-    // Required by CUTLASS sm90_gemm_tma_warpspecialized_cooperative.hpp (IsSm120Family check)
+-    using ArchTag = arch::Sm90;
+   };
+ 
+   using GmemTiledCopyA =

@@ -1,0 +1,30 @@
+From 541d977dc8245c4118d98dada76cc5a50b34e86a Mon Sep 17 00:00:00 2001
+From: Junhao Shen <junshen@nvidia.com>
+Date: Thu, 6 Nov 2025 12:22:07 +0800
+Subject: [PATCH] Flashinfer: TopK+TopP sampling from probs
+
+(cherry picked from commit 2bf369ddfa1f2b1a1432360e5026b953c856ab62)
+(cherry picked from commit cb69f2a674f88a3464d9fb20c80ffcc7fd605f02)
+(cherry picked from commit 243290e95934711a9ce31ebc8cfdd50e014b1237)
+---
+ vllm/v1/sample/ops/topk_topp_sampler.py | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/v1/sample/ops/topk_topp_sampler.py b/vllm/v1/sample/ops/topk_topp_sampler.py
+index 69b35830add2..e71b6cbfd195 100644
+--- a/vllm/v1/sample/ops/topk_topp_sampler.py
++++ b/vllm/v1/sample/ops/topk_topp_sampler.py
+@@ -501,10 +501,10 @@ def flashinfer_sample(
+         )
+     else:
+         # Both top-k and top-p.
+-        next_token_ids = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+-            logits, k, p, deterministic=True
++        probs = logits.softmax(dim=-1, dtype=torch.float32)
++        next_token_ids = flashinfer.sampling.top_k_top_p_sampling_from_probs(
++            probs, k, p, deterministic=True
+         )
+-
+     return next_token_ids.view(-1)
+ 
+ 

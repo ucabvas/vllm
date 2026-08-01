@@ -1,0 +1,374 @@
+From 092c4842e49a4bcbe13ce63e7df88eb332cd2fb2 Mon Sep 17 00:00:00 2001
+From: Stefano Castagnetta <scastagnetta@nvidia.com>
+Date: Wed, 17 Jun 2026 03:27:57 -0700
+Subject: [PATCH] [Security] CVE-2026-40962: bump FFmpeg to 8.1.1 + backport
+ CENC overflow fix to 5.1.6 shim
+
+Signed-off-by: Stefano Castagnetta <scastagnetta@nvidia.com>
+---
+ docker/Dockerfile                             |  8 ++-
+ docker/Dockerfile.cpu                         | 10 ++-
+ docker/Dockerfile.nightly_torch               | 10 ++-
+ docker/Dockerfile.tpu                         | 10 ++-
+ docker/Dockerfile.xpu                         | 10 ++-
+ requirements/common.txt                       | 15 +++--
+ tools/build-ffmpeg-safe.sh                    | 43 +++++++++++--
+ .../5.1.6-CVE-2026-40962-cenc-overflow.patch  | 61 +++++++++++++++++++
+ tools/strip-opencv-bundled-codecs.sh          |  5 +-
+ tools/verify-ffmpeg-safe.sh                   |  3 +
+ 10 files changed, 155 insertions(+), 20 deletions(-)
+ create mode 100644 tools/ffmpeg-patches/5.1.6-CVE-2026-40962-cenc-overflow.patch
+
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+index 1ada544280a6..f17c1573cc1d 100644
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -710,15 +710,21 @@ RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
+ # here but kept until after the vLLM install so they can be re-invoked to
+ # strip the FFmpeg libs that opencv-python-headless wheels bundle.
+ COPY tools/build-ffmpeg-safe.sh /tmp/build-ffmpeg-safe.sh
++COPY tools/ffmpeg-patches /tmp/ffmpeg-patches
+ COPY tools/verify-ffmpeg-safe.sh /tmp/verify-ffmpeg-safe.sh
+ COPY tools/strip-opencv-bundled-codecs.sh /tmp/strip-opencv-bundled-codecs.sh
+ RUN bash /tmp/build-ffmpeg-safe.sh \
+     && bash /tmp/verify-ffmpeg-safe.sh \
+     && FFMPEG_VERSION=5.1.6 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
+         bash /tmp/build-ffmpeg-safe.sh \
+-    && FFMPEG_VERSION=8.0.2 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
++    && FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
++        bash /tmp/verify-ffmpeg-safe.sh \
++    && FFMPEG_VERSION=8.1.1 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
+         bash /tmp/build-ffmpeg-safe.sh \
++    && FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
++        bash /tmp/verify-ffmpeg-safe.sh \
+     && rm /tmp/build-ffmpeg-safe.sh \
++    && rm -rf /tmp/ffmpeg-patches \
+     && rm -rf /var/lib/apt/lists/*
+ ENV PATH=/opt/ffmpeg-safe/bin:$PATH
+ ENV LD_LIBRARY_PATH=/opt/ffmpeg-safe/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+diff --git a/docker/Dockerfile.cpu b/docker/Dockerfile.cpu
+index d56d3395d797..bc1cff1d46dc 100644
+--- a/docker/Dockerfile.cpu
++++ b/docker/Dockerfile.cpu
+@@ -46,15 +46,21 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+ # /tmp so they can be re-invoked after pip installs (to strip the FFmpeg
+ # libs that opencv-python-headless wheels bundle).
+ COPY tools/build-ffmpeg-safe.sh /tmp/build-ffmpeg-safe.sh
++COPY tools/ffmpeg-patches /tmp/ffmpeg-patches
+ COPY tools/verify-ffmpeg-safe.sh /tmp/verify-ffmpeg-safe.sh
+ COPY tools/strip-opencv-bundled-codecs.sh /tmp/strip-opencv-bundled-codecs.sh
+ RUN bash /tmp/build-ffmpeg-safe.sh \
+     && bash /tmp/verify-ffmpeg-safe.sh \
+     && FFMPEG_VERSION=5.1.6 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
+         bash /tmp/build-ffmpeg-safe.sh \
+-    && FFMPEG_VERSION=8.0.2 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
++    && FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
++        bash /tmp/verify-ffmpeg-safe.sh \
++    && FFMPEG_VERSION=8.1.1 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
+         bash /tmp/build-ffmpeg-safe.sh \
+-    && rm /tmp/build-ffmpeg-safe.sh
++    && FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
++        bash /tmp/verify-ffmpeg-safe.sh \
++    && rm /tmp/build-ffmpeg-safe.sh \
++    && rm -rf /tmp/ffmpeg-patches
+ ENV PATH=/opt/ffmpeg-safe/bin:$PATH
+ ENV LD_LIBRARY_PATH=/opt/ffmpeg-safe/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+ ENV PKG_CONFIG_PATH=/opt/ffmpeg-safe/lib/pkgconfig:$PKG_CONFIG_PATH
+diff --git a/docker/Dockerfile.nightly_torch b/docker/Dockerfile.nightly_torch
+index 988960a80f78..0c006e126749 100644
+--- a/docker/Dockerfile.nightly_torch
++++ b/docker/Dockerfile.nightly_torch
+@@ -232,15 +232,21 @@ RUN --mount=type=cache,target=/root/.cache/uv \
+ # /tmp so they can be re-invoked after pip installs (to strip the FFmpeg
+ # libs that opencv-python-headless wheels bundle).
+ COPY tools/build-ffmpeg-safe.sh /tmp/build-ffmpeg-safe.sh
++COPY tools/ffmpeg-patches /tmp/ffmpeg-patches
+ COPY tools/verify-ffmpeg-safe.sh /tmp/verify-ffmpeg-safe.sh
+ COPY tools/strip-opencv-bundled-codecs.sh /tmp/strip-opencv-bundled-codecs.sh
+ RUN bash /tmp/build-ffmpeg-safe.sh \
+     && bash /tmp/verify-ffmpeg-safe.sh \
+     && FFMPEG_VERSION=5.1.6 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
+         bash /tmp/build-ffmpeg-safe.sh \
+-    && FFMPEG_VERSION=8.0.2 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
++    && FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
++        bash /tmp/verify-ffmpeg-safe.sh \
++    && FFMPEG_VERSION=8.1.1 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
+         bash /tmp/build-ffmpeg-safe.sh \
+-    && rm /tmp/build-ffmpeg-safe.sh
++    && FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
++        bash /tmp/verify-ffmpeg-safe.sh \
++    && rm /tmp/build-ffmpeg-safe.sh \
++    && rm -rf /tmp/ffmpeg-patches
+ ENV PATH=/opt/ffmpeg-safe/bin:$PATH
+ ENV LD_LIBRARY_PATH=/opt/ffmpeg-safe/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+ ENV PKG_CONFIG_PATH=/opt/ffmpeg-safe/lib/pkgconfig:$PKG_CONFIG_PATH
+diff --git a/docker/Dockerfile.tpu b/docker/Dockerfile.tpu
+index 2d5d1e5b5748..e645f9ea2b53 100644
+--- a/docker/Dockerfile.tpu
++++ b/docker/Dockerfile.tpu
+@@ -15,15 +15,21 @@ RUN apt-get update && apt-get install -y \
+ # /tmp so they can be re-invoked after pip installs (to strip the FFmpeg
+ # libs that opencv-python-headless wheels bundle).
+ COPY tools/build-ffmpeg-safe.sh /tmp/build-ffmpeg-safe.sh
++COPY tools/ffmpeg-patches /tmp/ffmpeg-patches
+ COPY tools/verify-ffmpeg-safe.sh /tmp/verify-ffmpeg-safe.sh
+ COPY tools/strip-opencv-bundled-codecs.sh /tmp/strip-opencv-bundled-codecs.sh
+ RUN bash /tmp/build-ffmpeg-safe.sh \
+     && bash /tmp/verify-ffmpeg-safe.sh \
+     && FFMPEG_VERSION=5.1.6 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
+         bash /tmp/build-ffmpeg-safe.sh \
+-    && FFMPEG_VERSION=8.0.2 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
++    && FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
++        bash /tmp/verify-ffmpeg-safe.sh \
++    && FFMPEG_VERSION=8.1.1 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
+         bash /tmp/build-ffmpeg-safe.sh \
+-    && rm /tmp/build-ffmpeg-safe.sh
++    && FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
++        bash /tmp/verify-ffmpeg-safe.sh \
++    && rm /tmp/build-ffmpeg-safe.sh \
++    && rm -rf /tmp/ffmpeg-patches
+ ENV PATH=/opt/ffmpeg-safe/bin:$PATH
+ ENV LD_LIBRARY_PATH=/opt/ffmpeg-safe/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+ ENV PKG_CONFIG_PATH=/opt/ffmpeg-safe/lib/pkgconfig:$PKG_CONFIG_PATH
+diff --git a/docker/Dockerfile.xpu b/docker/Dockerfile.xpu
+index b7d83f7a9585..e247d3d4551d 100644
+--- a/docker/Dockerfile.xpu
++++ b/docker/Dockerfile.xpu
+@@ -61,15 +61,21 @@ RUN apt clean && apt-get update -y && \
+ # /tmp so they can be re-invoked after pip installs (to strip the FFmpeg
+ # libs that opencv-python-headless wheels bundle).
+ COPY tools/build-ffmpeg-safe.sh /tmp/build-ffmpeg-safe.sh
++COPY tools/ffmpeg-patches /tmp/ffmpeg-patches
+ COPY tools/verify-ffmpeg-safe.sh /tmp/verify-ffmpeg-safe.sh
+ COPY tools/strip-opencv-bundled-codecs.sh /tmp/strip-opencv-bundled-codecs.sh
+ RUN bash /tmp/build-ffmpeg-safe.sh \
+     && bash /tmp/verify-ffmpeg-safe.sh \
+     && FFMPEG_VERSION=5.1.6 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
+         bash /tmp/build-ffmpeg-safe.sh \
+-    && FFMPEG_VERSION=8.0.2 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
++    && FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
++        bash /tmp/verify-ffmpeg-safe.sh \
++    && FFMPEG_VERSION=8.1.1 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
+         bash /tmp/build-ffmpeg-safe.sh \
+-    && rm /tmp/build-ffmpeg-safe.sh
++    && FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
++        bash /tmp/verify-ffmpeg-safe.sh \
++    && rm /tmp/build-ffmpeg-safe.sh \
++    && rm -rf /tmp/ffmpeg-patches
+ ENV PATH=/opt/ffmpeg-safe/bin:$PATH
+ ENV LD_LIBRARY_PATH=/opt/ffmpeg-safe/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+ ENV PKG_CONFIG_PATH=/opt/ffmpeg-safe/lib/pkgconfig:$PKG_CONFIG_PATH
+diff --git a/requirements/common.txt b/requirements/common.txt
+index a391913fc293..aeb3e241a96d 100644
+--- a/requirements/common.txt
++++ b/requirements/common.txt
+@@ -38,12 +38,15 @@ jsonschema >= 4.23.0 # required for MiniMax M3 tool schema validation
+ pyzmq >= 25.0.0
+ msgspec
+ mistral_common[image] >= 1.11.3
+-# TODO: opencv-python-headless wheels bundle their own FFmpeg under
+-# site-packages/opencv_python_headless.libs/, which includes native H.264,
+-# H.265/HEVC, and AAC decoders. /opt/ffmpeg-safe (MR !481/!482) does not
+-# close this path because cv2 is RPATH-linked to its bundled libs. See
+-# docs/royalty_codec_audit_report.md "Known gap" section for mitigation
+-# options. Track replacement work in a follow-up issue before merging.
++# opencv-python-headless wheels bundle their own FFmpeg under
++# site-packages/opencv_python_headless.libs/, which historically included
++# native H.264, H.265/HEVC, and AAC decoders. For Docker-based installs
++# this gap is now closed by tools/strip-opencv-bundled-codecs.sh, which
++# replaces the bundled libav* with symlinks to the codec-safe shim builds
++# at /opt/ffmpeg-safe-cv2-shim-v{5,8} (built via tools/build-ffmpeg-safe.sh).
++# TODO: bare `pip install vllm` outside Docker does not benefit from the
++# strip step. Track replacement work for pip-only installs in a follow-up
++# issue.
+ opencv-python-headless >= 4.13.0    # required for video IO
+ pyyaml
+ six>=1.16.0; python_version > '3.11' # transitive dependency of pandas that needs to be the latest version for python 3.12
+diff --git a/tools/build-ffmpeg-safe.sh b/tools/build-ffmpeg-safe.sh
+index b96b25332c7a..a2b7fc0e271f 100755
+--- a/tools/build-ffmpeg-safe.sh
++++ b/tools/build-ffmpeg-safe.sh
+@@ -1,4 +1,7 @@
+ #!/usr/bin/env bash
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++#
+ # Build a codec-safe FFmpeg from source.
+ #
+ # LOOSE variant: disables the H.264, H.265/HEVC, and AAC codec
+@@ -14,25 +17,32 @@
+ 
+ set -euo pipefail
+ 
+-FFMPEG_VERSION="${FFMPEG_VERSION:-7.1}"
++FFMPEG_VERSION="${FFMPEG_VERSION:-8.1.1}"
+ FFMPEG_PREFIX="${FFMPEG_PREFIX:-/opt/ffmpeg-safe}"
+ FFMPEG_TARBALL_URL="https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
+ # Tarball hash pinned in-script for tamper-evident builds. Update when
+ # bumping FFMPEG_VERSION. The upstream .sha256sum URL is not reliably
+ # served (404 on some releases), so we inline the canonical hash here
+ # instead of fetching it from the same host as the tarball.
+-FFMPEG_SHA256_7_1="40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6"
++#
++# Default 8.1.1 pin is shared with the amd64 cv2 shim. See the
++# FFMPEG_SHA256_8_1_1 declaration below.
+ # FFmpeg 5.1 LTS pin — used by the cv2-shim variant whose SONAME majors
+ # (libavcodec.so.59, libavformat.so.59, libavutil.so.57, libswscale.so.6,
+ # libswresample.so.4) match opencv-python-headless 4.13's bundled FFmpeg
+ # on arm64 / aarch64.
+ FFMPEG_SHA256_5_1_6="f4fa066278f7a47feab316fef905f4db0d5e9b589451949740f83972b30901bd"
+-# FFmpeg 8.0 LTS pin — used by the cv2-shim variant whose SONAME majors
++# FFmpeg 8.1.1 pin — used by the cv2-shim variant whose SONAME majors
+ # (libavcodec.so.62, libavformat.so.62, libavutil.so.60, libswscale.so.9,
+ # libswresample.so.6) match opencv-python-headless 4.13's bundled FFmpeg
+ # on amd64 / x86_64. The wheel builders apparently bundle different
+ # FFmpeg majors per platform, so both shims are required.
+-FFMPEG_SHA256_8_0_2="5d16962332603c427b3d0887fc12b9166d6ee2cb1108b1865dd2d5eb06a09505"
++#
++# 8.1.x is the first release line that contains the CENC-subsample
++# integer-overflow fix (CVE-2026-40962) in libavformat/mov.c. SONAME
++# stays at 62 across 8.x, so this is ABI-compatible with the opencv
++# amd64 wheel's bundled libavcodec.so.62.
++FFMPEG_SHA256_8_1_1="b6863adde98898f42602017462871b5f6333e65aec803fdd7a6308639c52edf3"
+ BUILD_DIR="$(mktemp -d)"
+ 
+ echo "[build-ffmpeg-safe] Installing build dependencies..."
+@@ -42,6 +52,7 @@ apt-get install -y --no-install-recommends \
+     ca-certificates \
+     wget \
+     xz-utils \
++    patch \
+     pkg-config \
+     build-essential \
+     nasm \
+@@ -69,6 +80,30 @@ echo "${expected_sha256}  ${tarball}" | sha256sum -c -
+ tar -xf "${tarball}"
+ cd "ffmpeg-${FFMPEG_VERSION}"
+ 
++# Apply any version-specific backport patches. Patches live next to this
++# script under ffmpeg-patches/ and are named "${FFMPEG_VERSION}-<slug>.patch"
++# so the script can pick the right set for whichever version is being built.
++# This is how downstream CVE backports land on FFmpeg versions whose SONAME
++# is pinned by ABI compatibility constraints (e.g. the 5.1.6 shim that has
++# to match opencv-python-headless's bundled libavcodec.so.59 on arm64).
++FFMPEG_PATCHES_DIR="${FFMPEG_PATCHES_DIR:-/tmp/ffmpeg-patches}"
++if [[ -d "${FFMPEG_PATCHES_DIR}" ]]; then
++    shopt -s nullglob
++    patches=("${FFMPEG_PATCHES_DIR}"/"${FFMPEG_VERSION}"-*.patch)
++    shopt -u nullglob
++    if (( ${#patches[@]} > 0 )); then
++        echo "[build-ffmpeg-safe] Applying ${#patches[@]} backport patch(es) for FFmpeg ${FFMPEG_VERSION}:"
++        for p in "${patches[@]}"; do
++            echo "  - $(basename "${p}")"
++            patch -p1 < "${p}"
++        done
++    else
++        echo "[build-ffmpeg-safe] No backport patches found for FFmpeg ${FFMPEG_VERSION} under ${FFMPEG_PATCHES_DIR}"
++    fi
++else
++    echo "[build-ffmpeg-safe] Patches dir ${FFMPEG_PATCHES_DIR} not present; skipping patch application."
++fi
++
+ echo "[build-ffmpeg-safe] Configuring (LOOSE: codecs disabled, MP4/MOV demuxers preserved)..."
+ ./configure \
+     --prefix="${FFMPEG_PREFIX}" \
+diff --git a/tools/ffmpeg-patches/5.1.6-CVE-2026-40962-cenc-overflow.patch b/tools/ffmpeg-patches/5.1.6-CVE-2026-40962-cenc-overflow.patch
+new file mode 100644
+index 000000000000..c944fe14670f
+--- /dev/null
++++ b/tools/ffmpeg-patches/5.1.6-CVE-2026-40962-cenc-overflow.patch
+@@ -0,0 +1,61 @@
++Backport of FFmpeg upstream commit e392fb8c9c to FFmpeg 5.1.6.
++
++  avformat/mov: use 64bit in CENC subsample bounds checks
++  Author: Michael Niedermayer <michael@niedermayer.cc>
++  Date:   2026-02-24
++
++This fixes CVE-2026-40962: an integer overflow in libavformat/mov.c CENC
++subsample bounds checks, where bytes_of_clear_data + bytes_of_protected_data
++(both uint32_t in libavutil/encryption_info.h) can wrap before the >size
++comparison and produce an out-of-bounds write in the cenc/cbc1/cens/cbcs
++decryption schemes.
++
++Upstream fixes only four call sites in 8.1.x; 5.1.6 has the same four
++vulnerable lines at the same shape. Casting the second operand to int64_t
++is sufficient — the comparison RHS (`size`) is already int, and the LHS
++operands are uint32_t each, so promoting just the second operand widens
++the entire expression to signed 64-bit per usual C integer-conversion rules.
++
++Backported by Guanxin Li <guanxinl@nvidia.com> for the safe-ffmpeg arm64
++shim build, which is pinned to FFmpeg 5.1.6 to match opencv-python-headless
++4.13's bundled libavcodec.so.59 ABI on arm64. FFmpeg 8.1.x (used for the
++amd64 shim) already contains this fix in tree.
++
++--- a/libavformat/mov.c
+++++ b/libavformat/mov.c
++@@ -6890,7 +6890,7 @@ static int cenc_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
++     }
++
++     for (i = 0; i < sample->subsample_count; i++) {
++-        if (sample->subsamples[i].bytes_of_clear_data + sample->subsamples[i].bytes_of_protected_data > size) {
+++        if (sample->subsamples[i].bytes_of_clear_data + (int64_t)sample->subsamples[i].bytes_of_protected_data > size) {
++             av_log(c->fc, AV_LOG_ERROR, "subsample size exceeds the packet size left\n");
++             return AVERROR_INVALIDDATA;
++         }
++@@ -6945,7 +6945,7 @@ static int cbc1_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
++     }
++
++     for (i = 0; i < sample->subsample_count; i++) {
++-        if (sample->subsamples[i].bytes_of_clear_data + sample->subsamples[i].bytes_of_protected_data > size) {
+++        if (sample->subsamples[i].bytes_of_clear_data + (int64_t)sample->subsamples[i].bytes_of_protected_data > size) {
++             av_log(c->fc, AV_LOG_ERROR, "subsample size exceeds the packet size left\n");
++             return AVERROR_INVALIDDATA;
++         }
++@@ -7007,7 +7007,7 @@ static int cens_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
++     }
++
++     for (i = 0; i < sample->subsample_count; i++) {
++-        if (sample->subsamples[i].bytes_of_clear_data + sample->subsamples[i].bytes_of_protected_data > size) {
+++        if (sample->subsamples[i].bytes_of_clear_data + (int64_t)sample->subsamples[i].bytes_of_protected_data > size) {
++             av_log(c->fc, AV_LOG_ERROR, "subsample size exceeds the packet size left\n");
++             return AVERROR_INVALIDDATA;
++         }
++@@ -7072,7 +7072,7 @@ static int cbcs_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
++     }
++
++     for (i = 0; i < sample->subsample_count; i++) {
++-        if (sample->subsamples[i].bytes_of_clear_data + sample->subsamples[i].bytes_of_protected_data > size) {
+++        if (sample->subsamples[i].bytes_of_clear_data + (int64_t)sample->subsamples[i].bytes_of_protected_data > size) {
++             av_log(c->fc, AV_LOG_ERROR, "subsample size exceeds the packet size left\n");
++             return AVERROR_INVALIDDATA;
++         }
+diff --git a/tools/strip-opencv-bundled-codecs.sh b/tools/strip-opencv-bundled-codecs.sh
+index 31593229b3a4..1e8e34557723 100755
+--- a/tools/strip-opencv-bundled-codecs.sh
++++ b/tools/strip-opencv-bundled-codecs.sh
+@@ -1,4 +1,7 @@
+ #!/usr/bin/env bash
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++#
+ # Replace the bundled FFmpeg shared libraries that opencv-python-headless
+ # wheels ship under site-packages/opencv_python_headless.libs/ with symlinks
+ # to a codec-safe FFmpeg shim of matching SONAME major version.
+@@ -52,7 +55,7 @@ if [[ ${#shim_for_soname[@]} -eq 0 ]]; then
+     echo "[strip-opencv-bundled-codecs] ERROR: no codec-safe shim found under ${FFMPEG_CV2_SHIM_GLOB}" >&2
+     echo "  Build at least one cv2 shim before running this script, e.g.:" >&2
+     echo "    FFMPEG_VERSION=5.1.6 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 bash build-ffmpeg-safe.sh" >&2
+-    echo "    FFMPEG_VERSION=8.0.2 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 bash build-ffmpeg-safe.sh" >&2
++    echo "    FFMPEG_VERSION=8.1.1 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 bash build-ffmpeg-safe.sh" >&2
+     exit 1
+ fi
+ 
+diff --git a/tools/verify-ffmpeg-safe.sh b/tools/verify-ffmpeg-safe.sh
+index 64e85d3e0b07..616027f699f9 100755
+--- a/tools/verify-ffmpeg-safe.sh
++++ b/tools/verify-ffmpeg-safe.sh
+@@ -1,4 +1,7 @@
+ #!/usr/bin/env bash
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++#
+ # Verify that the installed FFmpeg does NOT support the royalty-bearing
+ # codecs (H.264, H.265/HEVC, AAC).
+ #

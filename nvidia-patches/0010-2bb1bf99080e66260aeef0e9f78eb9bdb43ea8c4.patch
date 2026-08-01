@@ -1,0 +1,41 @@
+From 2bb1bf99080e66260aeef0e9f78eb9bdb43ea8c4 Mon Sep 17 00:00:00 2001
+From: jbernloehr <jbernloehr@nvidia.com>
+Date: Wed, 15 Apr 2026 10:14:00 +0200
+Subject: [PATCH] [Bugfix] Use __ray_terminate__ for graceful Ray worker
+ shutdown
+
+ray.kill() sends SIGKILL which bypasses atexit handlers, preventing
+any registered cleanup (e.g. profiling data flushes) from running on
+remote worker processes.
+
+Replace ray.kill() with __ray_terminate__.remote() which queues a
+graceful termination task that runs atexit handlers, as documented
+in ray.kill()'s own docstring.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 2a7a86458327b141f04bf9e045df119af9f1681d)
+(cherry picked from commit b0c7692878c3c55a7c1e2fe77b566c59254837d4)
+(cherry picked from commit 51e3720e39b73e5ea3ebf875130876f4444473e9)
+---
+ vllm/v1/executor/ray_executor.py | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/v1/executor/ray_executor.py b/vllm/v1/executor/ray_executor.py
+index 39749ffc257e..d1b20fc2a24a 100644
+--- a/vllm/v1/executor/ray_executor.py
++++ b/vllm/v1/executor/ray_executor.py
+@@ -106,10 +106,12 @@ def shutdown(self) -> None:
+             )
+         if hasattr(self, "forward_dag") and self.forward_dag is not None:
+             self.forward_dag.teardown()
+-            import ray
+ 
++            # Use __ray_terminate__ for graceful shutdown so that atexit
++            # handlers (e.g. profiling data flushes) can run.
++            # ray.kill() sends SIGKILL which skips atexit entirely.
+             for worker in self.workers:
+-                ray.kill(worker)
++                worker.__ray_terminate__.remote()
+             self.forward_dag = None
+ 
+     def _configure_ray_workers_use_nsight(self, ray_remote_kwargs) -> dict[str, Any]:

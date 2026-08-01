@@ -1,0 +1,82 @@
+From 5fe228648dbecf0f063df0298d67e9c077e44407 Mon Sep 17 00:00:00 2001
+From: Guanxin Li <guanxinl@nvidia.com>
+Date: Mon, 12 May 2025 18:26:11 -0700
+Subject: [PATCH] L0_weight_loading no module found issue
+
+(cherry picked from commit 1b2b4d7a1298bea6501f8b78ee2a49ba61f48864)
+(cherry picked from commit a2f405b782a594a7e8b0da06014844b47ca99a3d)
+(cherry picked from commit 9070b0970b119b822146e3a4a3ed5b33ff916a00)
+---
+ .gitlab-ci.yml                                | 49 +++++++++++++++++++
+ .../run_model_weight_loading_test.sh          |  2 +-
+ 2 files changed, 50 insertions(+), 1 deletion(-)
+ create mode 100644 .gitlab-ci.yml
+
+diff --git a/.gitlab-ci.yml b/.gitlab-ci.yml
+new file mode 100644
+index 000000000000..64b372da1c3f
+--- /dev/null
++++ b/.gitlab-ci.yml
+@@ -0,0 +1,49 @@
++# This file is a template, and might need editing before it works on your project.
++# This is a sample GitLab CI/CD configuration file that should run without any modifications.
++# It demonstrates a basic 3 stage CI/CD pipeline. Instead of real tests or scripts,
++# it uses echo commands to simulate the pipeline execution.
++#
++# A pipeline is composed of independent jobs that run scripts, grouped into stages.
++# Stages run in sequential order, but jobs within stages run in parallel.
++#
++# For more information, see: https://docs.gitlab.com/ee/ci/yaml/index.html#stages
++#
++# You can copy and paste this template into a new `.gitlab-ci.yml` file.
++# You should not add this template to an existing `.gitlab-ci.yml` file by using the `include:` keyword.
++#
++# To contribute improvements to CI/CD templates, please follow the Development guide at:
++# https://docs.gitlab.com/ee/development/cicd/templates.html
++# This specific template is located at:
++# https://gitlab.com/gitlab-org/gitlab/-/blob/master/lib/gitlab/ci/templates/Getting-Started.gitlab-ci.yml
++
++stages:          # List of stages for jobs, and their order of execution
++  - build
++  - test
++  - deploy
++
++build-job:       # This job runs in the build stage, which runs first.
++  stage: build
++  script:
++    - echo "Compiling the code..."
++    - echo "Compile complete."
++
++unit-test-job:   # This job runs in the test stage.
++  stage: test    # It only starts when the job in the build stage completes successfully.
++  script:
++    - echo "Running unit tests... This will take about 60 seconds."
++    - sleep 60
++    - echo "Code coverage is 90%"
++
++lint-test-job:   # This job also runs in the test stage.
++  stage: test    # It can run at the same time as unit-test-job (in parallel).
++  script:
++    - echo "Linting code... This will take about 10 seconds."
++    - sleep 10
++    - echo "No lint issues found."
++
++deploy-job:      # This job runs in the deploy stage.
++  stage: deploy  # It only runs when *both* jobs in the test stage complete successfully.
++  environment: production
++  script:
++    - echo "Deploying application..."
++    - echo "Application successfully deployed."
+diff --git a/tests/weight_loading/run_model_weight_loading_test.sh b/tests/weight_loading/run_model_weight_loading_test.sh
+index 8a899bc154f3..aa7b012e0da8 100755
+--- a/tests/weight_loading/run_model_weight_loading_test.sh
++++ b/tests/weight_loading/run_model_weight_loading_test.sh
+@@ -35,7 +35,7 @@ do
+     if [ ${#array[@]} -gt 3 ]; then
+         export MIN_CAPABILITY=${array[3]}
+     fi
+-    pytest -s weight_loading/test_weight_loading.py || LOCAL_SUCCESS=$?
++    pytest --import-mode=append -s weight_loading/test_weight_loading.py || LOCAL_SUCCESS=$?
+ 
+     if [[ $LOCAL_SUCCESS == 0 ]]; then
+         echo "=== PASSED MODEL: ${MODEL_CONFIG} ==="

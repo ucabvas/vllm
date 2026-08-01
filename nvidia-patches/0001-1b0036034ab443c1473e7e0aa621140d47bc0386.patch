@@ -1,0 +1,109 @@
+From 1b0036034ab443c1473e7e0aa621140d47bc0386 Mon Sep 17 00:00:00 2001
+From: Stefano Castagnetta <scastagnetta@nvidia.com>
+Date: Thu, 12 Feb 2026 12:06:04 +0100
+Subject: [PATCH] Unpin ties in requirements & comment out Dockerfile for
+ NVIDIA internal container build
+
+Signed-off-by: Stefano Castagnetta <scastagnetta@nvidia.com>
+(cherry picked from commit b24d82711bf9451278c40133556fdd05d99fd2e5)
+(cherry picked from commit 62be0fd363d558689224de1dc36c076643759abe)
+(cherry picked from commit a901fb5245cea88cdc5c88ec3c4ff60cb44e0618)
+---
+ pyproject.toml              |  2 +-
+ requirements/build/cuda.txt |  4 ++--
+ requirements/cuda.txt       | 16 ++++++++--------
+ requirements/test/cuda.txt  |  4 ----
+ 4 files changed, 11 insertions(+), 15 deletions(-)
+
+diff --git a/pyproject.toml b/pyproject.toml
+index 031f8d1a0a28..e76570a1edd7 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -7,7 +7,7 @@ requires = [
+     "setuptools>=77.0.3,<81.0.0",
+     "setuptools-scm>=8.0",
+     "setuptools-rust>=1.9.0",
+-    "torch == 2.11.0",
++    "torch",
+     "wheel",
+     "jinja2",
+ ]
+diff --git a/requirements/build/cuda.txt b/requirements/build/cuda.txt
+index 70da484a4133..2198d9e74967 100644
+--- a/requirements/build/cuda.txt
++++ b/requirements/build/cuda.txt
+@@ -5,9 +5,9 @@ packaging>=24.2
+ setuptools>=77.0.3,<81.0.0
+ setuptools-scm>=8
+ setuptools-rust>=1.9.0
+-torch==2.11.0
++torch
+ wheel
+-jinja2>=3.1.6
++jinja2
+ regex
+ build
+ protobuf >= 5.29.6, !=6.30.*, !=6.31.*, !=6.32.*, !=6.33.0.*, !=6.33.1.*, !=6.33.2.*, !=6.33.3.*, !=6.33.4.*
+diff --git a/requirements/cuda.txt b/requirements/cuda.txt
+index 19a1f63dd910..b938d2e28ff9 100644
+--- a/requirements/cuda.txt
++++ b/requirements/cuda.txt
+@@ -1,16 +1,16 @@
+ # Common dependencies
+ -r common.txt
+ 
+-numba == 0.65.0 # Required for N-gram speculative decoding
++numba # Required for N-gram speculative decoding
+ 
+ # Dependencies for NVIDIA GPUs
+-torch==2.11.0
+-torchaudio==2.11.0
+-# These must be updated alongside torch
+-torchvision==0.26.0 # Required for phi3v processor. See https://github.com/pytorch/vision?tab=readme-ov-file#installation for corresponding version
+-# FlashInfer should be updated together with the Dockerfile
+-flashinfer-python==0.6.12
+-flashinfer-cubin==0.6.12
++# in NVIDIA branches, torch/torchvision/torchaudio (and anything that depends on PyT)
++# should remain unpinned, as we build them ourselves at all matching versions
++torch
++torchaudio
++torchvision  # Required for phi3v processor. See https://github.com/pytorch/vision?tab=readme-ov-file#installation for corresponding version
++flashinfer-python  # version controlled by Dockerfile.pip wheel image
++flashinfer-cubin  # version controlled by Dockerfile.pip wheel image
+ apache-tvm-ffi==0.1.9
+ tilelang==0.1.9
+ nvidia-cudnn-frontend>=1.19.1
+diff --git a/requirements/test/cuda.txt b/requirements/test/cuda.txt
+index 76c343b91b16..82311bf3a553 100644
+--- a/requirements/test/cuda.txt
++++ b/requirements/test/cuda.txt
+@@ -438,7 +438,6 @@ num2words==0.5.14
+     # via -r requirements/test/cuda.in
+ numba==0.65.0
+     # via
+-    #   -c requirements/cuda.txt
+     #   -r requirements/test/cuda.in
+     #   librosa
+ numpy==2.2.6
+@@ -975,7 +974,6 @@ tokenizers==0.22.2
+     #   transformers
+ torch==2.11.0+cu130
+     # via
+-    #   -c requirements/cuda.txt
+     #   -r requirements/test/cuda.in
+     #   accelerate
+     #   bitsandbytes
+@@ -994,13 +992,11 @@ torch==2.11.0+cu130
+     #   vocos
+ torchaudio==2.11.0+cu130
+     # via
+-    #   -c requirements/cuda.txt
+     #   -r requirements/test/cuda.in
+     #   encodec
+     #   vocos
+ torchvision==0.26.0+cu130
+     # via
+-    #   -c requirements/cuda.txt
+     #   -r requirements/test/cuda.in
+     #   open-clip-torch
+     #   segmentation-models-pytorch

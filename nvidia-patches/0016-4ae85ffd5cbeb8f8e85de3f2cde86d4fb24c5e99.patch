@@ -1,0 +1,120 @@
+From 4ae85ffd5cbeb8f8e85de3f2cde86d4fb24c5e99 Mon Sep 17 00:00:00 2001
+From: Junhao Shen <junshen@nvidia.com>
+Date: Wed, 20 May 2026 18:00:00 +0000
+Subject: [PATCH] [MoE/b12x] Enable mixed-precision NVFP4+FP8 checkpoints on
+ flashinfer_b12x backend
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two follow-ups on PR #40082 (FlashInfer b12x MoE + FP4 GEMM kernels for
+SM120/SM121) that together make the new `flashinfer_b12x` backend usable
+on real-world mixed-precision NVFP4+FP8 checkpoints — e.g.
+`nvidia/Qwen3.6-35B-A3B-2.06GB-per-token` on DGX Spark (GB10, sm_121a).
+
+1. Accept W4A16 (kNvfp4Static, None) in FlashInferB12xExperts.supports().
+   The b12x kernel performs in-kernel BF16->FP4 activation quantization
+   (per the class docstring), so W4A16 NVFP4 checkpoints that declare no
+   runtime activation-quant key (`activation_key == None`, e.g.
+   compressed-tensors mixed-precision layouts) are runtime-compatible.
+   The current dispatcher gate
+   `(weight_key, activation_key) == (kNvfp4Static, kNvfp4Dynamic)`
+   rejects them. Loosen to also accept `(kNvfp4Static, None)`.
+
+2. Add VLLM_FP8_MOE_BACKEND env override. `--moe-backend` is consumed
+   by both the NVFP4 dispatcher (`oracle/nvfp4.py:map_nvfp4_backend`) and
+   the FP8 dispatcher (`oracle/fp8.py:map_fp8_backend`). `flashinfer_b12x`
+   is FP4-only by design, so the FP8 dispatcher has no equivalent and
+   `map_fp8_backend` raises:
+
+       ValueError: moe_backend='flashinfer_b12x' is not supported for FP8 MoE.
+
+   This blocks every checkpoint that pairs NVFP4 expert layers with FP8
+   ones. Introduce `VLLM_FP8_MOE_BACKEND` so callers can route the FP8
+   experts independently (e.g. `flashinfer_cutlass`) while keeping
+   `--moe-backend=flashinfer_b12x` for the NVFP4 majority. Unset
+   behavior is unchanged.
+
+Signed-off-by: Serge Panev <spanev@nvidia.com>
+(cherry picked from commit 36c373aaeec485d45d6da98d3407fd1e0021a3c8)
+---
+ vllm/envs.py                                  | 22 +++++++++++++++++++
+ .../layers/fused_moe/oracle/fp8.py            | 16 +++++++++++---
+ 2 files changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 27a85bb3d0e7..9e685364f120 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -188,6 +188,18 @@
+     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
+     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
+     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
++    VLLM_FP8_MOE_BACKEND: (
++        Literal[
++            "triton",
++            "deep_gemm",
++            "cutlass",
++            "flashinfer_trtllm",
++            "flashinfer_cutlass",
++            "marlin",
++            "aiter",
++        ]
++        | None
++    ) = None
+     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
+     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
+     VLLM_XGRAMMAR_CACHE_MB: int = 0
+@@ -1539,6 +1551,16 @@ def _resolve_rust_frontend_path() -> str | None:
+     "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": lambda: os.getenv(
+         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", None
+     ),
++    # FP8 MoE backend override. `--moe-backend` is consumed by both the
++    # NVFP4 and FP8 dispatchers; FP4-only kernels (e.g. flashinfer_b12x)
++    # have no FP8 equivalent. Set this to route FP8 experts in mixed-
++    # precision checkpoints to a different backend.
++    "VLLM_FP8_MOE_BACKEND": env_with_choices(
++        "VLLM_FP8_MOE_BACKEND",
++        None,
++        ["triton", "deep_gemm", "cutlass", "flashinfer_trtllm",
++         "flashinfer_cutlass", "marlin", "aiter"],
++    ),
+     # Flashinfer fused allreduce backend.
+     "VLLM_FLASHINFER_ALLREDUCE_BACKEND": env_with_choices(
+         "VLLM_FLASHINFER_ALLREDUCE_BACKEND",
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/fp8.py b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
+index 1b5030b19096..01f1dfbfe3a9 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/fp8.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
+@@ -221,7 +221,15 @@ def backend_to_kernel_cls(
+ 
+ 
+ def map_fp8_backend(runner_backend: MoEBackend) -> Fp8MoeBackend:
+-    """Map user's MoEBackend to Fp8MoeBackend."""
++    """Map user's MoEBackend to Fp8MoeBackend.
++
++    ``--moe-backend`` is consumed by both the NVFP4 and FP8 dispatchers.
++    For FP4-only kernels (e.g. ``flashinfer_b12x``), the FP8 dispatcher
++    has no equivalent and the mapping below would otherwise raise. Set
++    ``VLLM_FP8_MOE_BACKEND`` to override only the FP8-side routing while
++    keeping the user's ``--moe-backend`` value for the NVFP4 path.
++    """
++    effective = envs.VLLM_FP8_MOE_BACKEND or runner_backend
+     mapping = {
+         "triton": Fp8MoeBackend.TRITON,
+         "deep_gemm": Fp8MoeBackend.DEEPGEMM,
+@@ -231,10 +239,12 @@ def map_fp8_backend(runner_backend: MoEBackend) -> Fp8MoeBackend:
+         "marlin": Fp8MoeBackend.MARLIN,
+         "aiter": Fp8MoeBackend.AITER,
+     }
+-    if backend := mapping.get(runner_backend):
++    if backend := mapping.get(effective):
+         return backend
++    src = ("VLLM_FP8_MOE_BACKEND env var"
++           if envs.VLLM_FP8_MOE_BACKEND else "--moe-backend")
+     raise ValueError(
+-        f"moe_backend='{runner_backend}' is not supported for FP8 MoE. "
++        f"FP8 MoE backend='{effective}' (from {src}) is not supported. "
+         f"Expected one of {list(mapping.keys())}."
+     )
+ 

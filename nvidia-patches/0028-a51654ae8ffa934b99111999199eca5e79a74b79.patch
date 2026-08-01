@@ -1,0 +1,104 @@
+From a51654ae8ffa934b99111999199eca5e79a74b79 Mon Sep 17 00:00:00 2001
+From: Junhao Shen <junshen@nvidia.com>
+Date: Fri, 3 Jul 2026 20:44:58 +0800
+Subject: [PATCH] [Bugfix] FA4: don't pass dynamic_causal/output_scale to old
+ cute kernel
+
+vllm-src v0.24.0's FA4 wrapper (flash_attn_interface.py, fa_version==4) calls
+the cute _flash_attn_fwd with dynamic_causal= and output_scale=. The pinned
+flash-attn build's cute kernel has neither param, so MLA-prefill / ViT attention
+on Blackwell crashed:
+
+  TypeError: _flash_attn_fwd() got an unexpected keyword argument 'dynamic_causal'
+
+- flash_attn_interface.py: forward dynamic_causal/output_scale only when set
+  (both are None on these paths).
+- mla/prefill/flash_attn.py: feature-detect output_scale support in the cute
+  kernel; when absent, supports_quant_output() returns False so the fused-FP8
+  attention-output optimization is disabled and the model uses the correct
+  separate-quant fallback (no silent wrong output). Auto-re-enables if FA is bumped.
+
+Fixes CI: DeepSeek-R1-0528-NVFP4 (GB300), Qwen3.5-122B FP8/NVFP4 (GB200).
+
+Signed-off-by: junshen <junshen@nvidia.com>
+Co-authored-by: Claude <noreply@anthropic.com>
+---
+ .../backends/mla/prefill/flash_attn.py        | 19 +++++++++++++++++++
+ vllm/vllm_flash_attn/flash_attn_interface.py  | 13 +++++++++++--
+ 2 files changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/v1/attention/backends/mla/prefill/flash_attn.py b/vllm/v1/attention/backends/mla/prefill/flash_attn.py
+index 24763378e66b..793d0f0eeacc 100644
+--- a/vllm/v1/attention/backends/mla/prefill/flash_attn.py
++++ b/vllm/v1/attention/backends/mla/prefill/flash_attn.py
+@@ -28,6 +28,24 @@
+     flash_attn_varlen_func = None  # type: ignore[assignment]
+ 
+ 
++@functools.cache
++def _fa4_cute_supports_output_scale() -> bool:
++    """Whether the installed FA4 cute kernel accepts fused-FP8-output.
++
++    Older pinned flash-attn builds have no `output_scale` parameter, so the
++    fused-quantized-output optimization must be disabled for them (the model
++    falls back to computing bf16 attention and quantizing separately).
++    """
++    try:
++        import inspect
++
++        from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
++
++        return "output_scale" in inspect.signature(_flash_attn_fwd).parameters
++    except Exception:
++        return False
++
++
+ class FlashAttnPrefillBackend(MLAPrefillBackend):
+     """FlashAttention backend for MLA prefill."""
+ 
+@@ -99,6 +117,7 @@ def supports_quant_output(self, quant_key: "QuantKey") -> bool:
+             and device_capability is not None
+             and device_capability[0] in (10, 11)
+             and quant_key == kFp8StaticTensorSym
++            and _fa4_cute_supports_output_scale()
+         )
+ 
+     def _flash_attn_varlen_diff_headdims(
+diff --git a/vllm/vllm_flash_attn/flash_attn_interface.py b/vllm/vllm_flash_attn/flash_attn_interface.py
+index f0150033672e..272fe44964d9 100644
+--- a/vllm/vllm_flash_attn/flash_attn_interface.py
++++ b/vllm/vllm_flash_attn/flash_attn_interface.py
+@@ -388,6 +388,16 @@ def flash_attn_varlen_func(
+ 
+         from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
+ 
++        # `dynamic_causal` and `output_scale` are newer FA4 cute kwargs that
++        # older pinned flash-attn builds don't accept. Only forward them when
++        # set so we stay compatible with those builds (both are None on the
++        # MLA-prefill / ViT paths used here).
++        fa4_extra = {}
++        if dynamic_causal is not None:
++            fa4_extra["dynamic_causal"] = dynamic_causal
++        if output_scale is not None:
++            fa4_extra["output_scale"] = output_scale
++
+         out, softmax_lse = _flash_attn_fwd(
+             q,
+             k,
+@@ -400,7 +410,6 @@ def flash_attn_varlen_func(
+             page_table=block_table,
+             softmax_scale=softmax_scale,
+             causal=causal,
+-            dynamic_causal=dynamic_causal,
+             softcap=softcap,
+             window_size_left=real_window_size[0] if real_window_size[0] >= 0 else None,
+             window_size_right=real_window_size[1] if real_window_size[1] >= 0 else None,
+@@ -410,7 +419,7 @@ def flash_attn_varlen_func(
+             learnable_sink=s_aux,
+             mask_mod=mask_mod,
+             aux_tensors=aux_tensors,
+-            output_scale=output_scale,
++            **fa4_extra,
+         )
+     else:
+         raise ValueError(f"Unsupported FA version: {fa_version}")

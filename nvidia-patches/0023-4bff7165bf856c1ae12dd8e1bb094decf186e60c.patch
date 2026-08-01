@@ -1,0 +1,64 @@
+From 4bff7165bf856c1ae12dd8e1bb094decf186e60c Mon Sep 17 00:00:00 2001
+From: Stefano Castagnetta <scastagnetta@nvidia.com>
+Date: Fri, 5 Jun 2026 12:03:14 +0200
+Subject: [PATCH] Disable FlashInfer autotune by default (GB300 SM103
+ trtllm_fp4 MoE IMA)
+
+Reverts the default flip from upstream #42857 ("Re-enable flashinfer
+autotune by default"). On FlashInfer 0.6.12, the trtllm_fp4_block_scale_moe
+autotuner hits a CUDA illegal memory access on GB300 (SM103) during engine
+init, crashing DeepSeek-R1-0528-NVFP4 (and any NVFP4 MoE on the TRTLLM path).
+
+Root-caused on a GB300 node with dummy weights: holding cutlass-dsl at 4.5.0
+and flipping only FlashInfer 0.6.12 -> 0.6.11.post3 removes the IMA, and
+disabling the autotuner on 0.6.12 lets the throughput run complete cleanly.
+This is the same autotuner correctness class that kept enable_flashinfer_autotune
+False before #42857 (flashinfer-ai/flashinfer#3197).
+
+Re-enable once the FlashInfer autotuner is fixed on SM103.
+
+Signed-off-by: Stefano Castagnetta <scastagnetta@nvidia.com>
+---
+ vllm/config/vllm.py | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index ba7d26c93b23..a96fb717930c 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -232,7 +232,10 @@ def enable_mla_dual_rms_norm_fusion(cfg: "VllmConfig") -> bool:
+         "use_inductor_graph_partition": False,
+     },
+     "kernel_config": {
+-        "enable_flashinfer_autotune": True,
++        # FlashInfer 0.6.12's trtllm_fp4_block_scale_moe autotuner triggers an
++        # illegal memory access on GB300 (SM103); keep autotune off (the
++        # pre-#42857 default) until flashinfer-ai/flashinfer#3197 is fixed.
++        "enable_flashinfer_autotune": False,
+     },
+ }
+ OPTIMIZATION_LEVEL_02 = {
+@@ -253,7 +256,10 @@ def enable_mla_dual_rms_norm_fusion(cfg: "VllmConfig") -> bool:
+         "use_inductor_graph_partition": False,
+     },
+     "kernel_config": {
+-        "enable_flashinfer_autotune": True,
++        # FlashInfer 0.6.12's trtllm_fp4_block_scale_moe autotuner triggers an
++        # illegal memory access on GB300 (SM103); keep autotune off (the
++        # pre-#42857 default) until flashinfer-ai/flashinfer#3197 is fixed.
++        "enable_flashinfer_autotune": False,
+     },
+ }
+ OPTIMIZATION_LEVEL_03 = {
+@@ -274,7 +280,10 @@ def enable_mla_dual_rms_norm_fusion(cfg: "VllmConfig") -> bool:
+         "use_inductor_graph_partition": False,
+     },
+     "kernel_config": {
+-        "enable_flashinfer_autotune": True,
++        # FlashInfer 0.6.12's trtllm_fp4_block_scale_moe autotuner triggers an
++        # illegal memory access on GB300 (SM103); keep autotune off (the
++        # pre-#42857 default) until flashinfer-ai/flashinfer#3197 is fixed.
++        "enable_flashinfer_autotune": False,
+     },
+ }
+ 

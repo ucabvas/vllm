@@ -1,0 +1,147 @@
+From ef987ec72679db69f1048db8889c82d6bf4dce0c Mon Sep 17 00:00:00 2001
+From: Stefano Castagnetta <scastagnetta@nvidia.com>
+Date: Wed, 3 Jun 2026 17:30:21 +0200
+Subject: [PATCH] Lint/typing fixes for v0.22.0 b12x carryover
+
+Pre-commit over the replayed b12x patches on v0.22.0:
+- ruff format reflow of VLLM_FP8_MOE_BACKEND choices, the FP8 backend
+  error `src`, and the Qwen3.5 MTP expert-ignore append
+- ruff: drop the duplicate `ParallelLMHead` import in modelopt.py and
+  collapse `_supports_quant_scheme` to return its condition (SIM103)
+- mypy: annotate `FlashInferB12xExperts._wrapper` as
+  `B12xMoEWrapper | None` (TYPE_CHECKING import) and assert non-None
+  after `_ensure_wrapper()` so `.run()` type-checks
+
+Signed-off-by: Stefano Castagnetta <scastagnetta@nvidia.com>
+---
+ vllm/envs.py                                       | 11 +++++++++--
+ .../fused_moe/experts/flashinfer_b12x_moe.py       | 14 +++++++++-----
+ vllm/model_executor/layers/fused_moe/oracle/fp8.py |  5 +++--
+ .../model_executor/layers/quantization/modelopt.py |  1 -
+ vllm/model_executor/models/qwen3_5_mtp.py          |  4 +---
+ 5 files changed, 22 insertions(+), 13 deletions(-)
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 9e685364f120..013ff9adab4e 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -1558,8 +1558,15 @@ def _resolve_rust_frontend_path() -> str | None:
+     "VLLM_FP8_MOE_BACKEND": env_with_choices(
+         "VLLM_FP8_MOE_BACKEND",
+         None,
+-        ["triton", "deep_gemm", "cutlass", "flashinfer_trtllm",
+-         "flashinfer_cutlass", "marlin", "aiter"],
++        [
++            "triton",
++            "deep_gemm",
++            "cutlass",
++            "flashinfer_trtllm",
++            "flashinfer_cutlass",
++            "marlin",
++            "aiter",
++        ],
+     ),
+     # Flashinfer fused allreduce backend.
+     "VLLM_FLASHINFER_ALLREDUCE_BACKEND": env_with_choices(
+diff --git a/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py b/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py
+index 83a875094a95..bf81e1765cbc 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++from typing import TYPE_CHECKING
++
+ import torch
+ 
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+@@ -26,6 +28,9 @@
+     has_flashinfer_b12x_moe,
+ )
+ 
++if TYPE_CHECKING:
++    from flashinfer.fused_moe import B12xMoEWrapper
++
+ 
+ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
+     """FlashInfer CuteDSL fused MoE expert for SM12x (SM120/SM121,
+@@ -92,7 +97,7 @@ def __init__(
+         self.source_format = self._detect_source_format()
+ 
+         # Lazily created on first apply() call.
+-        self._wrapper: object | None = None
++        self._wrapper: B12xMoEWrapper | None = None
+         # Populated in process_weights_after_loading.
+         self.w1_sf_mma: torch.Tensor | None = None
+         self.w2_sf_mma: torch.Tensor | None = None
+@@ -216,16 +221,14 @@ def _supports_quant_scheme(
+         # W4A16 NVFP4 compressed-tensors `nvfp4-pack-quantized`.
+         # (askliar #43333: compressed-tensors layout has explicit weight
+         # spec but activation_key=None.)
+-        if (
++        return (
+             weight_key is not None
+             and weight_key.dtype == torch.uint8
+             and weight_key.scale == kNvfp4StaticGroupScale
+             and weight_key.scale2 == kStaticTensorScale
+             and weight_key.symmetric
+             and activation_key is None
+-        ):
+-            return True
+-        return False
++        )
+ 
+     @staticmethod
+     def _supports_activation(activation: MoEActivation) -> bool:
+@@ -318,6 +321,7 @@ def apply(
+         )
+ 
+         self._ensure_wrapper()
++        assert self._wrapper is not None
+ 
+         result = self._wrapper.run(
+             x=hidden_states,
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/fp8.py b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
+index 01f1dfbfe3a9..1c44c5706d13 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/fp8.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
+@@ -241,8 +241,9 @@ def map_fp8_backend(runner_backend: MoEBackend) -> Fp8MoeBackend:
+     }
+     if backend := mapping.get(effective):
+         return backend
+-    src = ("VLLM_FP8_MOE_BACKEND env var"
+-           if envs.VLLM_FP8_MOE_BACKEND else "--moe-backend")
++    src = (
++        "VLLM_FP8_MOE_BACKEND env var" if envs.VLLM_FP8_MOE_BACKEND else "--moe-backend"
++    )
+     raise ValueError(
+         f"FP8 MoE backend='{effective}' (from {src}) is not supported. "
+         f"Expected one of {list(mapping.keys())}."
+diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
+index 033d533f2cdc..29694280f379 100644
+--- a/vllm/model_executor/layers/quantization/modelopt.py
++++ b/vllm/model_executor/layers/quantization/modelopt.py
+@@ -52,7 +52,6 @@
+     LinearMethodBase,
+     UnquantizedLinearMethod,
+ )
+-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+ from vllm.model_executor.layers.quantization import QuantizationMethods
+ from vllm.model_executor.layers.quantization.base_config import (
+     QuantizationConfig,
+diff --git a/vllm/model_executor/models/qwen3_5_mtp.py b/vllm/model_executor/models/qwen3_5_mtp.py
+index e1989d7489d0..20e7d90cab58 100644
+--- a/vllm/model_executor/models/qwen3_5_mtp.py
++++ b/vllm/model_executor/models/qwen3_5_mtp.py
+@@ -107,9 +107,7 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+             for idx in range(self.num_mtp_layers):
+                 for eid in range(num_experts):
+                     for proj in ("gate_proj", "up_proj", "down_proj"):
+-                        extra.append(
+-                            f"{prefix}.layers.{idx}.mlp.experts.{eid}.{proj}"
+-                        )
++                        extra.append(f"{prefix}.layers.{idx}.mlp.experts.{eid}.{proj}")
+             new_entries = [n for n in extra if n not in quant_config.ignore]
+             quant_config.ignore.extend(new_entries)
+             if new_entries:

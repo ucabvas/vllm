@@ -1,0 +1,46 @@
+From 0209a81982d842c1d20f573b6c7410fafbea0c64 Mon Sep 17 00:00:00 2001
+From: Zack Aristei <zaristei@nvidia.com>
+Date: Tue, 25 Nov 2025 05:22:23 -0800
+Subject: [PATCH] WAR for Multinode issue
+
+Signed-off-by: Stefano Castagnetta <scastagnetta@nvidia.com>
+(cherry picked from commit aae128f5131f8ee57fecfc4a726cb06fe3de88db)
+(cherry picked from commit c23fd6c02938b8e2a33c31b04c8618d65a537239)
+(cherry picked from commit f26ad497b65ae796e83a705a31609a0330be07d6)
+---
+ vllm/config/parallel.py | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/config/parallel.py b/vllm/config/parallel.py
+index 5bd528f4c9c8..d66d8827304f 100644
+--- a/vllm/config/parallel.py
++++ b/vllm/config/parallel.py
+@@ -884,13 +884,24 @@ def __post_init__(self) -> None:
+                 current_platform.is_cuda()
+                 and current_platform.device_count() < self.world_size
+             ):
++                if not ray_found:
++                    raise ValueError(
++                        "Unable to load Ray: "
++                        f"{ray_utils.ray_import_err}. Ray is "
++                        "required for multi-node inference, "
++                        "please install Ray with `pip install "
++                        "ray`."
++                    )
++                backend = "ray"
+                 gpu_count = current_platform.device_count()
+-                raise ValueError(
+-                    f"World size ({self.world_size}) is larger than the number of "
+-                    f"available GPUs ({gpu_count}) in this node. If this is "
++                logger.warning(
++                    "World size (%d) is larger than the number of "
++                    "available GPUs (%d) in this node. If this is "
+                     "intentional and you are using:\n"
+                     "- ray, set '--distributed-executor-backend ray'.\n"
+-                    "- multiprocessing, set '--nnodes' appropriately."
++                    "- multiprocessing, set '--nnodes' appropriately.",
++                    self.world_size,
++                    gpu_count,
+                 )
+             elif self.data_parallel_backend == "ray":
+                 logger.info(

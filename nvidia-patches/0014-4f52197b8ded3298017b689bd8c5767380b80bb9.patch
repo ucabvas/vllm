@@ -1,0 +1,61 @@
+From 4f52197b8ded3298017b689bd8c5767380b80bb9 Mon Sep 17 00:00:00 2001
+From: Stefano Castagnetta <scastagnetta@nvidia.com>
+Date: Thu, 14 May 2026 16:56:57 +0200
+Subject: [PATCH] Pin xgrammar, nvidia-cutlass-dsl, quack-kernels for internal
+ container alignment
+
+Hard-pin three previously-range-pinned dependencies to match what's
+validated for the 26.05.post1 container on top of vLLM v0.21.0 +
+FlashInfer v0.6.11.post2:
+
+- xgrammar==0.2.0 (only stable 0.2.x release; satisfies upstream's new
+  >=0.2.0 constraint).
+- nvidia-cutlass-dsl==4.5.0 (matches FlashInfer v0.6.11.post2's pinned
+  >=4.5.0 dependency; upstream vLLM v0.21.0 pins 4.4.2 but that creates
+  an unresolvable pip metadata conflict against the FI wheel). The
+  CUTLASS Arch enum ordering change in 4.5.0 broke the FA4 SM100 fwd
+  kernel arch-range check on GB300 (SM103) per
+  vllm-project/flash-attention#138; the previous patch in this branch
+  (Always copy+rewrite FA4 cute/) carries the WAR for that assertion.
+- quack-kernels==0.4.1 (latest stable; upstream's range allows >=0.3.3).
+
+Range pins let pip resolve to whatever PyPI calls latest at build time,
+so consecutive devel-tag builds can land on different versions without
+any code change. Hard pin them here so the next rebase's classification
+sees them as PICK and replays them with the -x marker.
+
+Signed-off-by: Stefano Castagnetta <scastagnetta@nvidia.com>
+(cherry picked from commit 9bf15e6979f4438192436016823095ae8eb5f58d)
+---
+ requirements/common.txt | 2 +-
+ requirements/cuda.txt   | 3 ++-
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/requirements/common.txt b/requirements/common.txt
+index 9e3818091e3a..d5271d8cf4d0 100644
+--- a/requirements/common.txt
++++ b/requirements/common.txt
+@@ -26,7 +26,7 @@ outlines_core == 0.2.14
+ # required for outlines backend disk cache
+ diskcache == 5.6.3
+ lark == 1.2.2
+-xgrammar >= 0.2.1, < 1.0.0; platform_machine == "x86_64" or platform_machine == "aarch64" or platform_machine == "arm64" or platform_machine == "s390x" or platform_machine == "ppc64le"
++xgrammar == 0.2.0; platform_machine == "x86_64" or platform_machine == "aarch64" or platform_machine == "arm64" or platform_machine == "s390x" or platform_machine == "ppc64le"
+ typing_extensions >= 4.10
+ filelock >= 3.16.1 # need to contain https://github.com/tox-dev/filelock/pull/317
+ partial-json-parser # used for parsing partial JSON outputs
+diff --git a/requirements/cuda.txt b/requirements/cuda.txt
+index 65560c8040a4..e8d38f54ee08 100644
+--- a/requirements/cuda.txt
++++ b/requirements/cuda.txt
+@@ -18,8 +18,9 @@ nvidia-cudnn-frontend>=1.19.1
+ fastsafetensors >= 0.3.2
+ 
+ # QuACK and Cutlass DSL for FA4 (cute-DSL implementation)
++# Hard-pinned for internal container reproducibility.
+ nvidia-cutlass-dsl[cu13]==4.5.2
+-quack-kernels>=0.3.3
++quack-kernels==0.4.1
+ 
+ # Tokenspeed_MLA for faster mla with spec decode
+ tokenspeed-mla==0.1.2

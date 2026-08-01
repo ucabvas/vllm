@@ -1,0 +1,67 @@
+From 667791319ff0b378e2e26d82db574525a1836695 Mon Sep 17 00:00:00 2001
+From: Stefano Castagnetta <scastagnetta@nvidia.com>
+Date: Wed, 8 Jul 2026 16:40:27 +0100
+Subject: [PATCH] Re-enable FlashInfer autotune by default (GB300 SM103 IMA
+ fixed in FlashInfer 0.6.14)
+
+Reverts "Disable FlashInfer autotune by default (GB300 SM103 trtllm_fp4
+MoE IMA)" (4bff7165bf), restoring the upstream #42857 default of
+enable_flashinfer_autotune=True in optimization levels O1/O2/O3.
+
+The WAR was added because FlashInfer 0.6.12's trtllm_fp4_block_scale_moe
+autotuner hit a CUDA illegal memory access on GB300 (SM103) during engine
+init. Verified fixed on FlashInfer 0.6.14: on a GB300 (SM103) node with
+the main-py3.57117927-devel-arm64 container (FI 0.6.14, vLLM 0.24.0),
+Nemotron-3-Nano-30B-A3B-NVFP4 with moe_backend=flashinfer_trtllm and
+enable_flashinfer_autotune=true completed the full autotune pass
+(trtllm_fp4_block_scale_moe 21/21 profiles, 60 fp4_gemm tunings) and a
+throughput run with no IMA.
+
+Re-enabling recovers the FP8 GEMM throughput regression tracked under
+NVBug 6361628 (6-50% across platforms with autotune off).
+
+Signed-off-by: Stefano Castagnetta <scastagnetta@nvidia.com>
+---
+ vllm/config/vllm.py | 15 +++------------
+ 1 file changed, 3 insertions(+), 12 deletions(-)
+
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index a96fb717930c..ba7d26c93b23 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -232,10 +232,7 @@ def enable_mla_dual_rms_norm_fusion(cfg: "VllmConfig") -> bool:
+         "use_inductor_graph_partition": False,
+     },
+     "kernel_config": {
+-        # FlashInfer 0.6.12's trtllm_fp4_block_scale_moe autotuner triggers an
+-        # illegal memory access on GB300 (SM103); keep autotune off (the
+-        # pre-#42857 default) until flashinfer-ai/flashinfer#3197 is fixed.
+-        "enable_flashinfer_autotune": False,
++        "enable_flashinfer_autotune": True,
+     },
+ }
+ OPTIMIZATION_LEVEL_02 = {
+@@ -256,10 +253,7 @@ def enable_mla_dual_rms_norm_fusion(cfg: "VllmConfig") -> bool:
+         "use_inductor_graph_partition": False,
+     },
+     "kernel_config": {
+-        # FlashInfer 0.6.12's trtllm_fp4_block_scale_moe autotuner triggers an
+-        # illegal memory access on GB300 (SM103); keep autotune off (the
+-        # pre-#42857 default) until flashinfer-ai/flashinfer#3197 is fixed.
+-        "enable_flashinfer_autotune": False,
++        "enable_flashinfer_autotune": True,
+     },
+ }
+ OPTIMIZATION_LEVEL_03 = {
+@@ -280,10 +274,7 @@ def enable_mla_dual_rms_norm_fusion(cfg: "VllmConfig") -> bool:
+         "use_inductor_graph_partition": False,
+     },
+     "kernel_config": {
+-        # FlashInfer 0.6.12's trtllm_fp4_block_scale_moe autotuner triggers an
+-        # illegal memory access on GB300 (SM103); keep autotune off (the
+-        # pre-#42857 default) until flashinfer-ai/flashinfer#3197 is fixed.
+-        "enable_flashinfer_autotune": False,
++        "enable_flashinfer_autotune": True,
+     },
+ }
+ 

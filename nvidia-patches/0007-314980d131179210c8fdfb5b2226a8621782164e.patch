@@ -1,0 +1,90 @@
+From 314980d131179210c8fdfb5b2226a8621782164e Mon Sep 17 00:00:00 2001
+From: Zack Aristei <zaristei@nvidia.com>
+Date: Mon, 19 Jan 2026 07:26:09 -0800
+Subject: [PATCH] Update CUDA architecture specifications in CMakeLists.txt for
+ Marlin support, enhancing compatibility with newer GPU architectures.
+
+Update CUDA architecture specifications in CMakeLists.txt to include additional Marlin support for newer GPU architectures.
+
+(cherry picked from commit 27c230240a9f6697c5112e25fba43a0d92268542)
+(cherry picked from commit a2f29b7432a6d483865c00b878c46136d3ee2e2e)
+(cherry picked from commit 78778ede0eb274ed6fe28b427888530875d36773)
+---
+ CMakeLists.txt | 34 +++++++++++++++++++++++-----------
+ 1 file changed, 23 insertions(+), 11 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 292551960c89..8bf97629c981 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -529,20 +529,22 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
+     # are not supported by Machete yet.
+ 
+     # marlin arches for fp16 output
+-    # Family-conditional 12.0f (one cubin for SM12x family) requires CUDA >= 13.0;
+-    # fall back to architecture-specific 12.0a;12.1a on CUDA < 13.0 (e.g. 12.8).
++    # NVIDIA-internal container build: broaden Marlin arch coverage to the full
++    # union we ship across DGX/Jetson SKUs:
++    #   CUDA >= 13: 8.0;9.0a;10.0f;11.0a;12.0f+PTX
++    #   CUDA <  13: 8.0;9.0a;10.0f;11.0a;12.0a;12.1a+PTX
+     if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+-      cuda_archs_loose_intersection(MARLIN_ARCHS "8.0+PTX;12.0f" "${CUDA_ARCHS}")
++      cuda_archs_loose_intersection(MARLIN_ARCHS "8.0;9.0a;10.0f;11.0a;12.0f+PTX" "${CUDA_ARCHS}")
+     else()
+-      cuda_archs_loose_intersection(MARLIN_ARCHS "8.0+PTX;12.0a;12.1a" "${CUDA_ARCHS}")
++      cuda_archs_loose_intersection(MARLIN_ARCHS "8.0;9.0a;10.0f;11.0a;12.0a;12.1a+PTX" "${CUDA_ARCHS}")
+     endif()
+     # marlin has limited support for turing
+     cuda_archs_loose_intersection(MARLIN_SM75_ARCHS "7.5" "${CUDA_ARCHS}")
+-    # marlin arches for bf16 output (we need 9.0 for bf16 atomicAdd PTX)
++    # marlin arches for bf16 output (we need 9.0 for bf16 atomicAdd PTX; covered by 9.0a in the union)
+     if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+-      cuda_archs_loose_intersection(MARLIN_BF16_ARCHS "8.0+PTX;9.0+PTX;12.0f" "${CUDA_ARCHS}")
++      cuda_archs_loose_intersection(MARLIN_BF16_ARCHS "8.0;9.0a;10.0f;11.0a;12.0f+PTX" "${CUDA_ARCHS}")
+     else()
+-      cuda_archs_loose_intersection(MARLIN_BF16_ARCHS "8.0+PTX;9.0+PTX;12.0a;12.1a" "${CUDA_ARCHS}")
++      cuda_archs_loose_intersection(MARLIN_BF16_ARCHS "8.0;9.0a;10.0f;11.0a;12.0a;12.1a+PTX" "${CUDA_ARCHS}")
+     endif()
+     # marlin arches for fp8 input
+     # - sm80 doesn't support fp8 computation
+@@ -554,7 +556,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
+       cuda_archs_loose_intersection(MARLIN_FP8_ARCHS "8.9;12.0a;12.1a" "${CUDA_ARCHS}")
+     endif()
+     # marlin arches for other files
+-    cuda_archs_loose_intersection(MARLIN_OTHER_ARCHS "7.5;8.0+PTX" "${CUDA_ARCHS}")
++    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
++      cuda_archs_loose_intersection(MARLIN_OTHER_ARCHS "7.5;8.0;9.0a;10.0f;11.0a;12.0f+PTX" "${CUDA_ARCHS}")
++    else()
++      cuda_archs_loose_intersection(MARLIN_OTHER_ARCHS "7.5;8.0;9.0a;10.0f;11.0a;12.0a;12.1a+PTX" "${CUDA_ARCHS}")
++    endif()
+ 
+     if (MARLIN_OTHER_ARCHS)
+ 
+@@ -1152,10 +1158,12 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
+   # moe marlin arches
+   # note that we always set `use_atomic_add=False` for moe marlin now,
+   # so we don't need 9.0 for bf16 atomicAdd PTX
++  # NVIDIA-internal container build: broaden MOE Marlin arch coverage to the full
++  # union we ship across DGX/Jetson SKUs (same union as the Marlin block above).
+   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+-    cuda_archs_loose_intersection(MARLIN_MOE_ARCHS "8.0+PTX;12.0f" "${CUDA_ARCHS}")
++    cuda_archs_loose_intersection(MARLIN_MOE_ARCHS "8.0;9.0a;10.0f;11.0a;12.0f+PTX" "${CUDA_ARCHS}")
+   else()
+-    cuda_archs_loose_intersection(MARLIN_MOE_ARCHS "8.0+PTX;12.0a;12.1a" "${CUDA_ARCHS}")
++    cuda_archs_loose_intersection(MARLIN_MOE_ARCHS "8.0;9.0a;10.0f;11.0a;12.0a;12.1a+PTX" "${CUDA_ARCHS}")
+   endif()
+   # moe marlin has limited support for turing
+   cuda_archs_loose_intersection(MARLIN_MOE_SM75_ARCHS "7.5" "${CUDA_ARCHS}")
+@@ -1169,7 +1177,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
+     cuda_archs_loose_intersection(MARLIN_MOE_FP8_ARCHS "8.9;12.0a;12.1a" "${CUDA_ARCHS}")
+   endif()
+   # moe marlin arches for other files
+-  cuda_archs_loose_intersection(MARLIN_MOE_OTHER_ARCHS "7.5;8.0+PTX" "${CUDA_ARCHS}")
++  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
++    cuda_archs_loose_intersection(MARLIN_MOE_OTHER_ARCHS "7.5;8.0;9.0a;10.0f;11.0a;12.0f+PTX" "${CUDA_ARCHS}")
++  else()
++    cuda_archs_loose_intersection(MARLIN_MOE_OTHER_ARCHS "7.5;8.0;9.0a;10.0f;11.0a;12.0a;12.1a+PTX" "${CUDA_ARCHS}")
++  endif()
+   if (MARLIN_MOE_OTHER_ARCHS)
+ 
+     #

@@ -1,0 +1,47 @@
+From 9cabf4b2cc353b938de6f59d4b3bdae478bbc0c2 Mon Sep 17 00:00:00 2001
+From: weimingc <17592131+meenchen@users.noreply.github.com>
+Date: Tue, 12 May 2026 22:13:15 -0700
+Subject: [PATCH] Map Qwen3.5 VLM checkpoint prefixes
+
+Signed-off-by: weimingc <17592131+meenchen@users.noreply.github.com>
+(cherry picked from commit 0dfa8ac58d42b8d411e3b67a6fa130604b33e4f6)
+---
+ vllm/model_executor/models/qwen3_5.py | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+index 43b90046382d..71a2a13181ef 100644
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -99,6 +99,7 @@
+ from .utils import (
+     AutoWeightsLoader,
+     PPMissingLayer,
++    WeightsMapper,
+     _merge_multimodal_embeddings,
+     extract_layer_index,
+     is_pp_missing_parameter,
+@@ -447,6 +448,14 @@ class Qwen3_5ForCausalLMBase(
+     SupportsLoRA,
+     SupportsPP,
+ ):
++    hf_to_vllm_mapper = WeightsMapper(
++        orig_to_new_prefix={
++            "model.language_model.": "model.",
++            "language_model.model.": "model.",
++            "language_model.lm_head.": "lm_head.",
++        }
++    )
++
+     packed_modules_mapping = {
+         "qkv_proj": [
+             "q_proj",
+@@ -533,7 +542,7 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+             self,
+             skip_prefixes=["mtp."],
+         )
+-        return loader.load_weights(weights)
++        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+ 
+ 
+ class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):

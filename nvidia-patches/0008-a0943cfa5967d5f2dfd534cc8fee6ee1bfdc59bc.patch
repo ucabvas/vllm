@@ -1,0 +1,27 @@
+From a0943cfa5967d5f2dfd534cc8fee6ee1bfdc59bc Mon Sep 17 00:00:00 2001
+From: Zack Aristei <zaristei@nvidia.com>
+Date: Thu, 19 Mar 2026 05:52:22 -0700
+Subject: [PATCH] fix: bump pyasn1 to 0.6.3 for CVE-2026-30922
+
+(cherry picked from commit c677e85775e7570bef8af0c3a110bc4a9da0c470)
+(cherry picked from commit 7d78b655b57c12338306896d4ef76653d21c9c5d)
+
+Signed-off-by: Stefano Castagnetta <scastagnetta@nvidia.com>
+(cherry picked from commit df8f77cc09b6cc0e58d40738afb886140324f749)
+---
+ requirements/test/cuda.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/requirements/test/cuda.txt b/requirements/test/cuda.txt
+index 82311bf3a553..9043f1cf04a9 100644
+--- a/requirements/test/cuda.txt
++++ b/requirements/test/cuda.txt
+@@ -672,7 +672,7 @@ pyarrow==23.0.0
+     # via
+     #   datasets
+     #   genai-perf
+-pyasn1==0.6.1
++pyasn1==0.6.3  # CVE-2026-30922
+     # via
+     #   pyasn1-modules
+     #   rsa

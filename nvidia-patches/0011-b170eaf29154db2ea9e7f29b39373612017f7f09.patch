@@ -1,0 +1,110 @@
+From b170eaf29154db2ea9e7f29b39373612017f7f09 Mon Sep 17 00:00:00 2001
+From: Stefano Castagnetta <scastagnetta@nvidia.com>
+Date: Thu, 23 Apr 2026 09:03:18 +0200
+Subject: [PATCH] Pin transformers to 5.6.0 for internal container alignment
+
+Signed-off-by: Stefano Castagnetta <scastagnetta@nvidia.com>
+(cherry picked from commit 0e0aba21e45357daa957087c357c58fed204acc9)
+(cherry picked from commit 287ecb0623054160cebdb566113cc3bc07279f6d)
+(cherry picked from commit cddecfd81a38c520157ff125ef75eda3d6de6b92)
+---
+ requirements/common.txt             | 2 +-
+ requirements/test/cuda.in           | 2 +-
+ requirements/test/cuda.txt          | 2 +-
+ requirements/test/nightly-torch.txt | 2 +-
+ requirements/test/rocm.in           | 2 +-
+ requirements/test/rocm.txt          | 2 +-
+ requirements/test/xpu.txt           | 2 +-
+ 7 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/requirements/common.txt b/requirements/common.txt
+index a5d74e14e64d..9e3818091e3a 100644
+--- a/requirements/common.txt
++++ b/requirements/common.txt
+@@ -7,7 +7,7 @@ requests >= 2.26.0
+ tqdm
+ blake3
+ py-cpuinfo
+-transformers >= 5.5.3
++transformers == 5.6.0
+ tokenizers >= 0.21.1  # Required for fast incremental detokenization.
+ safetensors >= 0.6.2  # MXFP4/MXFP6 dtype support (F8_E8M0, F4) added in 0.6.0: https://github.com/huggingface/safetensors/pull/611
+ protobuf >= 5.29.6, !=6.30.*, !=6.31.*, !=6.32.*, !=6.33.0.*, !=6.33.1.*, !=6.33.2.*, !=6.33.3.*, !=6.33.4.* # Required by LlamaTokenizer, gRPC. CVE-2026-0994
+diff --git a/requirements/test/cuda.in b/requirements/test/cuda.in
+index a7fc65def8ef..4609f8b64cd1 100644
+--- a/requirements/test/cuda.in
++++ b/requirements/test/cuda.in
+@@ -38,7 +38,7 @@ opencv-python-headless >= 4.13.0 # required for video test
+ datamodel_code_generator # required for minicpm3 test
+ lm-eval[api]>=0.4.12 # required for model evaluation test
+ mteb[bm25s]>=2, <3 # required for mteb test
+-transformers==5.5.3
++transformers==5.6.0
+ tokenizers==0.22.2
+ schemathesis>=4.0.0 # Required for openai schema test.
+ # quantization
+diff --git a/requirements/test/cuda.txt b/requirements/test/cuda.txt
+index 9043f1cf04a9..91683be22ab3 100644
+--- a/requirements/test/cuda.txt
++++ b/requirements/test/cuda.txt
+@@ -1016,7 +1016,7 @@ tqdm==4.67.3
+     #   segmentation-models-pytorch
+     #   sentence-transformers
+     #   transformers
+-transformers==5.5.3
++transformers==5.6.0
+     # via
+     #   -c requirements/common.txt
+     #   -r requirements/test/cuda.in
+diff --git a/requirements/test/nightly-torch.txt b/requirements/test/nightly-torch.txt
+index a58e0fa248fd..038b45ea5cca 100644
+--- a/requirements/test/nightly-torch.txt
++++ b/requirements/test/nightly-torch.txt
+@@ -29,7 +29,7 @@ opencv-python-headless >= 4.13.0 # required for video test
+ datamodel_code_generator # required for minicpm3 test
+ lm-eval[api]>=0.4.12 # required for model evaluation test
+ mteb[bm25s]>=2, <3 # required for mteb test
+-transformers==5.5.3
++transformers==5.6.0
+ tokenizers==0.22.2
+ schemathesis>=4.0.0 # Required for openai schema test.
+ # quantization
+diff --git a/requirements/test/rocm.in b/requirements/test/rocm.in
+index 046ca09ff7f4..4846e8ab4c5b 100644
+--- a/requirements/test/rocm.in
++++ b/requirements/test/rocm.in
+@@ -37,7 +37,7 @@ opencv-python-headless>=4.13.0 # required for video test
+ datamodel_code_generator # required for minicpm3 test
+ lm-eval[api]>=0.4.12 # required for model evaluation test
+ mteb[bm25s]>=2, <3 # required for mteb test
+-transformers==5.5.3
++transformers==5.6.0
+ tokenizers==0.22.2
+ schemathesis>=4.0.0 # Required for openai schema test
+ # quantization
+diff --git a/requirements/test/rocm.txt b/requirements/test/rocm.txt
+index 842d2ff31882..f057eeb1977a 100644
+--- a/requirements/test/rocm.txt
++++ b/requirements/test/rocm.txt
+@@ -1219,7 +1219,7 @@ tqdm==4.67.3
+     #   sentence-transformers
+     #   tilelang
+     #   transformers
+-transformers==5.5.3
++transformers==5.6.0
+     # via
+     #   -c requirements/common.txt
+     #   -r requirements/test/../common.txt
+diff --git a/requirements/test/xpu.txt b/requirements/test/xpu.txt
+index 40f23b95d107..c467627a0f76 100644
+--- a/requirements/test/xpu.txt
++++ b/requirements/test/xpu.txt
+@@ -667,7 +667,7 @@ tqdm==4.67.3
+     #   pqdm
+     #   sentence-transformers
+     #   transformers
+-transformers==5.5.3
++transformers==5.6.0
+     # via
+     #   -c requirements/common.txt
+     #   sentence-transformers

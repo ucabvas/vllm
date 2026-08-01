@@ -1,0 +1,61 @@
+From 860421677d31736aca7d2a9c4807c2f51a46294b Mon Sep 17 00:00:00 2001
+From: Andrii Skliar <askliar@nvidia.com>
+Date: Thu, 21 May 2026 18:41:44 +0200
+Subject: [PATCH] add compressed tensors fix
+
+(cherry picked from commit a8de5dea62869d639ddfa591ce6e1e405972a46b)
+(cherry picked from commit 478f17e0ebf512744c5ef730d7160dc825c5951f)
+---
+ .../fused_moe/experts/flashinfer_b12x_moe.py  | 26 +++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py b/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py
+index 7d6256ac8558..83a875094a95 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py
+@@ -89,12 +89,37 @@ def __init__(
+             "fp4" if quant_config.a1_gscale is not None else "bf16"
+         )
+ 
++        self.source_format = self._detect_source_format()
++
+         # Lazily created on first apply() call.
+         self._wrapper: object | None = None
+         # Populated in process_weights_after_loading.
+         self.w1_sf_mma: torch.Tensor | None = None
+         self.w2_sf_mma: torch.Tensor | None = None
+ 
++    @staticmethod
++    def _detect_source_format() -> str:
++        """Walk the constructor's call stack to find the parent quant-method
++        class and map it to a FlashInfer ``source_format`` string.
++
++        ``make_nvfp4_moe_kernel`` instantiates the experts class from the
++        parent method's ``create_weights`` (compressed-tensors) or equivalent
++        (modelopt) — so the parent ``self`` is reachable in an outer frame.
++        Fall back to "modelopt" if no recognized parent is found.
++        """
++        import inspect
++
++        for frame_info in inspect.stack():
++            parent = frame_info.frame.f_locals.get("self")
++            if parent is None:
++                continue
++            cls_name = type(parent).__name__
++            if "CompressedTensors" in cls_name:
++                return "compressed_tensors"
++            if "ModelOpt" in cls_name:
++                return "modelopt"
++        return "modelopt"
++
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         # Normalise block scales to absorb the per-expert weight global scale
+         # (w_gs).  vLLM's NVFP4 convention stores:
+@@ -258,6 +283,7 @@ def _ensure_wrapper(self) -> None:
+             num_local_experts=self.num_local_experts,
+             activation=self._activation_str,
+             activation_precision=self.activation_precision,
++            source_format=self.source_format,
+         )
+ 
+     def apply(

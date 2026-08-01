@@ -1,0 +1,41 @@
+From f667c2ebcdc34aa3372c6971eb0bc4589ba2feeb Mon Sep 17 00:00:00 2001
+From: Junhao Shen <junshen@nvidia.com>
+Date: Thu, 2 Jul 2026 21:56:09 +0800
+Subject: [PATCH] [Bugfix][Test] Don't pass derived is_act_and_mul to
+ FusedMoEConfig
+
+`FusedMoEConfig.is_act_and_mul` is a read-only property (== activation.is_gated),
+not a constructor field. make_dummy_moe_config() forwarded it to the
+FusedMoEConfig(...) ctor, so every MoE kernel test that used the helper crashed
+during collection/setup with:
+
+  TypeError: FusedMoEConfig.__init__() got an unexpected keyword argument
+  'is_act_and_mul'
+
+Stop forwarding it; the value is derived from `activation`. The helper's
+is_act_and_mul kwarg is kept for call-site compatibility.
+
+Fixes CI: L1_kernels MoE suites (deepgemm, fp4_moe, fp8_moe, b200_suite,
+spark/thor fp4_moe).
+
+Signed-off-by: junshen <junshen@nvidia.com>
+Co-authored-by: Claude <noreply@anthropic.com>
+---
+ tests/kernels/moe/utils.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/tests/kernels/moe/utils.py b/tests/kernels/moe/utils.py
+index affd9be98787..e846efb0bd13 100644
+--- a/tests/kernels/moe/utils.py
++++ b/tests/kernels/moe/utils.py
+@@ -76,7 +76,9 @@ def make_dummy_moe_config(
+         num_logical_experts=num_experts,
+         moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+         activation=activation,
+-        is_act_and_mul=is_act_and_mul,
++        # `is_act_and_mul` is a derived property of FusedMoEConfig
++        # (== activation.is_gated), not a constructor arg. It is determined
++        # by `activation`; the kwarg above is retained for call-site compat.
+         in_dtype=in_dtype,
+         device="cuda",
+         routing_method=RoutingMethodType.TopK,

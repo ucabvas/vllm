@@ -1,0 +1,47 @@
+From eff17f0577f1d04aa4abeabab759d879b7187077 Mon Sep 17 00:00:00 2001
+From: Junhao Shen <junshen@nvidia.com>
+Date: Thu, 2 Jul 2026 21:46:36 +0800
+Subject: [PATCH] [Bugfix] Accept shard_id in
+ KVCacheScaleParameter.weight_loader
+
+The stacked/fused weight-loading path (e.g. vllm/model_executor/models/
+qwen2.py:461) calls every non-default weight_loader as
+`weight_loader(param, loaded_weight, shard_id)`. KVCacheScaleParameter's
+loader only accepted 2 positional args, so loading FP8/FP4 checkpoints with
+fused-qkv kv-cache scales crashed with:
+
+  TypeError: KVCacheScaleParameter.weight_loader() takes 2 positional
+  arguments but 3 were given
+
+Accept and ignore shard_id: kv-cache scales are shared per-layer scalars,
+so the shard is irrelevant here (per-head scales use a separate loader).
+
+Fixes CI: L1_e2e_Qwen3-8B-FP4/FP8 on GB300/SPARK/THOR.
+
+Signed-off-by: junshen <junshen@nvidia.com>
+Co-authored-by: Claude <noreply@anthropic.com>
+---
+ vllm/model_executor/layers/quantization/kv_cache.py | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/model_executor/layers/quantization/kv_cache.py b/vllm/model_executor/layers/quantization/kv_cache.py
+index 100632686b0e..ecfa2cbc6035 100644
+--- a/vllm/model_executor/layers/quantization/kv_cache.py
++++ b/vllm/model_executor/layers/quantization/kv_cache.py
+@@ -30,7 +30,15 @@ def __new__(cls) -> "KVCacheScaleParameter":
+         return super().__new__(cls, torch.tensor(-1.0), requires_grad=False)
+ 
+     @staticmethod
+-    def weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor) -> None:
++    def weight_loader(
++        param: torch.nn.Parameter,
++        loaded_weight: torch.Tensor,
++        shard_id: str | int | None = None,
++    ) -> None:
++        # `shard_id` is accepted for compatibility with the stacked/fused
++        # weight-loading path (e.g. qwen2.py), which passes it to every
++        # non-default loader. KV-cache scales are shared per-layer scalars,
++        # so the shard is irrelevant here; per-head scales use a separate path.
+         if loaded_weight.numel() != 1:
+             raise ValueError(
+                 f"KV-cache scale expects a scalar weight, got shape "
