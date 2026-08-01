@@ -180,7 +180,17 @@ class Backend(Enum):
     ADA = 101376  # RTX 4090
     AMPERE = 166912  # A100
     HOPPER = 232448  # H100
-    DEFAULT = 102400  # Default
+    # DEFAULT was 102400, which consumer-class Blackwell (SM120/SM121) misses by
+    # exactly 1024 bytes: GB10 / DGX Spark reports max_shared_mem = 101376, the
+    # same value as ADA. check_shared_mem() therefore returned False and the GDN
+    # chunk kernels silently halved their tiles
+    #   chunk_o.py:  BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
+    #   cumsum.py:   BS_LIST  = [32, 64]  if check_shared_mem() else [16, 32]
+    # Qwen3.5 is a hybrid 3x gated-DeltaNet : 1x full-attention model, so that
+    # penalty applies to three quarters of its layers. Lowering the default to
+    # ADA's value only changes behaviour for devices in [101376, 102400) -- i.e.
+    # exactly this class of GPU; anything smaller still fails the check.
+    DEFAULT = 101376  # Default (ADA / consumer Blackwell shared-mem ceiling)
 
     @classmethod
     def get_shared_memory(cls, arch: str) -> int:
